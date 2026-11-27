@@ -1,13 +1,18 @@
 const { app, BrowserWindow, ipcMain, desktopCapturer, screen, globalShortcut, Tray, Menu, nativeImage } = require('electron');
 const path = require('path');
 const fs = require('fs');
+const os = require('os');
+const { systemPreferences } = require('electron');
 
 const HEADER = 44, BORDER = 14; // должны совпадать с index.html
 const OCR = { en: 'eng', ru: 'rus', de: 'deu', fr: 'fra', es: 'spa', zh: 'chi_sim', ja: 'jpn' };
 const AUTO_OCR = ['eng', 'rus', 'deu', 'fra', 'spa'];
 const FRANC = { eng: 'en', rus: 'ru', deu: 'de', fra: 'fr', spa: 'es', cmn: 'zh', jpn: 'ja' };
 const S = { engine: 'google', src: 'en', tgt: 'ru', bounds: null };
-let win, tray, paused = false, busy = false, prev = null, start = null;
+let win, tray, paused = false, busy = false, prev = null, start = null, lastItems = 0, askedPerm = false;
+// macOS 15+ (Darwin 24+): ScreenCaptureKit игнорирует скрытие окна от захвата -> прячем перевод на момент снимка
+const HIDE_MODE = process.platform === 'darwin' && parseInt(os.release(), 10) >= 24;
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const send = (ch, d) => win && !win.isDestroyed() && win.webContents.send(ch, d);
 
 // ---------- настройки ----------
@@ -41,7 +46,7 @@ function createWindow() {
 function setPaused(p) {
   paused = p; prev = null;
   send('paused', p);
-  if (p) send('result', []);
+  if (p) { send('result', []); lastItems = 0; }
   refreshMenu();
 }
 function toggleVisible() {
@@ -139,14 +144,44 @@ async function offline(text) {
   return step(await step(text, s, 'en'), 'en', t); // через английский
 }
 
+const cache = new Map();
+async function translate(text) {
+  const key = `${S.engine}|${S.src}|${S.tgt}|${text}`;
+  if (cache.has(key)) return cache.get(key);
+  const out = S.engine === 'google' ? await google(text) : await offline(text);
+  if (cache.size > 500) cache.clear();
+  cache.set(key, out);
+  return out;
+}
+
+// светлый текст на тёмном фоне Tesseract читает хуже -> инвертируем тёмные кадры
+function prepare(img) {
+  const { width, height } = img.getSize();
+  const buf = Buffer.from(img.toBitmap());
+  let sum = 0, n = 0;
+  for (let i = 0; i < buf.length; i += 64) { sum += (buf[i] + buf[i + 1] + buf[i + 2]) / 3; n++; }
+  if (n && sum / n < 110) for (let i = 0; i < buf.length; i += 4) { buf[i] = 255 - buf[i]; buf[i + 1] = 255 - buf[i + 1]; buf[i + 2] = 255 - buf[i + 2]; }
+  return nativeImage.createFromBitmap(buf, { width, height });
+}
+
 // ---------- основной цикл ----------
 async function cycle() {
   const b = win.getBounds();
   const d = screen.getDisplayMatching(b), sf = d.scaleFactor;
-  const srcs = await desktopCapturer.getSources({
-    types: ['screen'],
-    thumbnailSize: { width: Math.round(d.size.width * sf), height: Math.round(d.size.height * sf) },
-  });
+  if (process.platform === 'darwin' && systemPreferences.getMediaAccessStatus('screen') !== 'granted') {
+    send('status', 'Нужно разрешение «Запись экрана» (Настройки → Конфиденциальность), затем перезапустите');
+    if (!askedPerm) { askedPerm = true; await desktopCapturer.getSources({ types: ['screen'], thumbnailSize: { width: 1, height: 1 } }); }
+    return;
+  }
+  const hide = HIDE_MODE && lastItems > 0;
+  if (hide) { send('hide', true); await sleep(90); }
+  let srcs;
+  try {
+    srcs = await desktopCapturer.getSources({
+      types: ['screen'],
+      thumbnailSize: { width: Math.round(d.size.width * sf), height: Math.round(d.size.height * sf) },
+    });
+  } finally { if (hide) send('hide', false); }
   const s = srcs.find((x) => x.display_id === String(d.id)) || srcs[0];
   if (!s) return;
   const full = s.thumbnail, fs_ = full.getSize();
@@ -167,27 +202,35 @@ async function cycle() {
   if (S.src === S.tgt) return send('result', []);
 
   // мелкий текст распознаётся заметно лучше после увеличения
-  const ocrImg = sf < 2 ? img.resize({ width: r.width * 2, quality: 'best' }) : img;
+  const ocrImg = prepare(sf < 2 ? img.resize({ width: r.width * 2, quality: 'best' }) : img);
   const k = ocrImg.getSize().width / (b.width - 2 * BORDER); // px картинки -> CSS-px
 
   const w = await getWorker();
   send('status', 'Распознаю…');
   const { data } = await w.recognize(ocrImg.toPNG(), {}, { blocks: true });
   const paras = (data.paragraphs || (data.blocks || []).flatMap((x) => x.paragraphs || []))
-    .filter((p) => p.confidence > 50 && p.text.trim().length > 1);
+    .filter((p) => p.confidence > 50 && (p.text.match(/\p{L}/gu) || []).length >= 2);
 
   send('status', 'Перевожу…');
   const texts = paras.map((p) => p.text.replace(/\s*\n\s*/g, ' ').trim());
-  let out;
-  if (S.engine === 'google') out = await Promise.all(texts.map(google));
-  else { out = []; for (const t of texts) out.push(await offline(t)); }
-
-  send('result', paras.map((p, i) => ({
-    x: p.bbox.x0 / k, y: p.bbox.y0 / k, w: (p.bbox.x1 - p.bbox.x0) / k, h: (p.bbox.y1 - p.bbox.y0) / k,
-    lh: (p.bbox.y1 - p.bbox.y0) / k / Math.max(1, (p.lines || []).length || 1),
-    text: out[i],
-  })));
-  send('status', '');
+  const res = [];
+  if (S.engine === 'google') res.push(...(await Promise.allSettled(texts.map(translate))));
+  else for (const t of texts) {
+    try { res.push({ status: 'fulfilled', value: await translate(t) }); } catch (e) { res.push({ status: 'rejected', reason: e }); }
+  }
+  const fail = res.find((x) => x.status === 'rejected');
+  const items = [];
+  paras.forEach((p, i) => {
+    if (res[i].status !== 'fulfilled' || !res[i].value) return;
+    items.push({
+      x: p.bbox.x0 / k, y: p.bbox.y0 / k, w: (p.bbox.x1 - p.bbox.x0) / k, h: (p.bbox.y1 - p.bbox.y0) / k,
+      lh: (p.bbox.y1 - p.bbox.y0) / k / Math.max(1, (p.lines || []).length || 1),
+      text: res[i].value,
+    });
+  });
+  send('result', items);
+  lastItems = items.length;
+  send('status', fail ? String(fail.reason.message || fail.reason).slice(0, 80) : '');
 }
 
 async function tick() {
@@ -196,7 +239,7 @@ async function tick() {
     try { await cycle(); } catch (e) { prev = null; send('status', String(e.message || e).slice(0, 80)); }
     busy = false;
   }
-  setTimeout(tick, 700);
+  setTimeout(tick, HIDE_MODE ? 1100 : 700);
 }
 
 if (!app.requestSingleInstanceLock()) app.quit();
