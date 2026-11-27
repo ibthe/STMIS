@@ -2,14 +2,14 @@ const { app, BrowserWindow, ipcMain, desktopCapturer, screen, globalShortcut, Tr
 const path = require('path');
 const fs = require('fs');
 const os = require('os');
-const { systemPreferences } = require('electron');
+const { systemPreferences, utilityProcess } = require('electron');
 
 const HEADER = 44, BORDER = 14; // должны совпадать с index.html
 const OCR = { en: 'eng', ru: 'rus', de: 'deu', fr: 'fra', es: 'spa', zh: 'chi_sim', ja: 'jpn' };
 const AUTO_OCR = ['eng', 'rus', 'deu', 'fra', 'spa'];
 const FRANC = { eng: 'en', rus: 'ru', deu: 'de', fra: 'fr', spa: 'es', cmn: 'zh', jpn: 'ja' };
 const S = { engine: 'google', src: 'en', tgt: 'ru', bounds: null };
-let win, tray, paused = false, busy = false, prev = null, start = null, lastItems = 0, askedPerm = false;
+let win, tray, paused = false, busy = false, prev = null, start = null, lastItems = 0, askedPerm = false, gen = 0;
 // macOS 15+ (Darwin 24+): ScreenCaptureKit игнорирует скрытие окна от захвата -> прячем перевод на момент снимка
 const HIDE_MODE = process.platform === 'darwin' && parseInt(os.release(), 10) >= 24;
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -79,7 +79,7 @@ ipcMain.on('drag', (_, m) => {
   if (m.mode === 'move') win.setBounds({ ...start, x: start.x + m.dx, y: start.y + m.dy });
   else win.setBounds({ ...start, width: Math.max(360, start.width + m.dx), height: Math.max(140, start.height + m.dy) });
 });
-ipcMain.on('set', (_, s) => { Object.assign(S, s); prev = null; save(); });
+ipcMain.on('set', (_, s) => { Object.assign(S, s); prev = null; save(); gen++; cancelPending(); send('progress', null); send('status', ''); });
 ipcMain.on('pause', (_, p) => setPaused(p));
 ipcMain.on('close', () => app.quit());
 
@@ -97,9 +97,19 @@ async function getWorker() {
   const key = langs.join('+');
   if (worker && workerLang === key) return worker;
   if (worker) await worker.terminate();
-  send('status', 'Загрузка языка OCR…');
+  send('progress', { text: 'Загрузка языка OCR…', pct: null });
   const { createWorker } = require('tesseract.js');
-  worker = await createWorker(langs, 1, { cachePath: app.getPath('userData') });
+  const make = createWorker(langs, 1, {
+    cachePath: app.getPath('userData'),
+    logger: (m) => {
+      if (String(m.status).startsWith('loading') && typeof m.progress === 'number')
+        send('progress', { text: `Загрузка языка OCR: ${Math.round(m.progress * 100)}%`, pct: m.progress });
+    },
+  });
+  let timer;
+  const timeout = new Promise((_, rej) => { timer = setTimeout(() => rej(new Error('Не удалось скачать языковой пакет OCR — проверьте интернет')), 90000); });
+  try { worker = await Promise.race([make, timeout]); } finally { clearTimeout(timer); }
+  send('progress', null);
   workerLang = key;
   return worker;
 }
@@ -113,24 +123,69 @@ async function google(text) {
   return j[0].map((x) => x[0]).join('');
 }
 
-const pipes = new Map();
-function getPipe(s, t) {
-  const key = `${s}-${t}`;
-  if (!pipes.has(key)) {
-    send('status', `Загрузка модели ${key}…`);
-    const p = import('@xenova/transformers').then(({ pipeline, env }) => {
-      env.cacheDir = path.join(app.getPath('userData'), 'models');
-      return pipeline('translation', `Xenova/opus-mt-${s}-${t}`);
-    });
-    p.catch(() => pipes.delete(key));
-    pipes.set(key, p);
-  }
-  return pipes.get(key);
+// Офлайн-модель живёт в отдельном процессе (translator.js), главный процесс не блокируется
+const HOSTS = ['https://huggingface.co/', 'https://hf-mirror.com/'];
+let hostIdx = 0, child = null, seq = 0;
+const pending = new Map();
+const mb = (n) => (n / 1048576).toFixed(0);
+
+function killChild() { if (child) { const c = child; child = null; c.kill(); } }
+function cancelPending() {
+  for (const p of pending.values()) { clearTimeout(p.timer); p.reject(new Error('cancelled')); }
+  pending.clear();
+}
+function ensureChild() {
+  if (child) return child;
+  const c = child = utilityProcess.fork(path.join(__dirname, 'translator.js'));
+  c.on('message', (m) => {
+    if (m.type) {
+      for (const p of pending.values()) p.arm(); // есть признаки жизни — сбрасываем таймер зависания
+      if (S.engine !== 'offline') return;
+      if (m.type === 'progress') send('progress', { text: `Загрузка модели ${m.key}: ${mb(m.loaded)} / ${mb(m.total)} МБ`, pct: m.loaded / m.total });
+      else if (m.type === 'loading') send('progress', { text: `Загрузка модели ${m.key}…`, pct: null });
+      else if (m.type === 'ready') send('progress', null);
+      return;
+    }
+    const p = pending.get(m.id);
+    if (!p) return;
+    clearTimeout(p.timer); pending.delete(m.id);
+    if (m.ok) p.resolve(m.value); else p.reject(new Error(m.error));
+  });
+  c.on('exit', () => {
+    if (child === c) child = null;
+    for (const p of pending.values()) { clearTimeout(p.timer); p.reject(new Error('Процесс перевода завершился')); }
+    pending.clear();
+  });
+  return c;
+}
+function callWorker(text, s, t) {
+  return new Promise((resolve, reject) => {
+    const id = ++seq;
+    const p = { resolve, reject, timer: null };
+    p.arm = () => {
+      clearTimeout(p.timer);
+      p.timer = setTimeout(() => {
+        pending.delete(id); killChild();
+        reject(new Error(`Нет ответа от ${new URL(HOSTS[hostIdx]).host} (60 с)`));
+      }, 60000);
+    };
+    pending.set(id, p); p.arm();
+    ensureChild().postMessage({ id, text, s, t, host: HOSTS[hostIdx], cacheDir: path.join(app.getPath('userData'), 'models') });
+  });
 }
 async function step(text, s, t) {
-  const p = await getPipe(s, t);
-  const out = await p(text, { max_new_tokens: 256 });
-  return out[0].translation_text;
+  for (let attempt = 0; ; attempt++) {
+    try { return await callWorker(text, s, t); }
+    catch (e) {
+      if (e.message === 'cancelled') throw e;
+      if (attempt === 0) { // первая попытка не удалась — пробуем другой источник моделей
+        hostIdx = (hostIdx + 1) % HOSTS.length;
+        send('progress', { text: `Не вышло, пробую ${new URL(HOSTS[hostIdx]).host}…`, pct: null });
+        continue;
+      }
+      hostIdx = 0; throw e;
+    }
+  }
 }
 async function detect(text) {
   const { franc } = await import('franc-min');
@@ -166,6 +221,7 @@ function prepare(img) {
 
 // ---------- основной цикл ----------
 async function cycle() {
+  const g = gen;
   const b = win.getBounds();
   const d = screen.getDisplayMatching(b), sf = d.scaleFactor;
   if (process.platform === 'darwin' && systemPreferences.getMediaAccessStatus('screen') !== 'granted') {
@@ -211,13 +267,16 @@ async function cycle() {
   const paras = (data.paragraphs || (data.blocks || []).flatMap((x) => x.paragraphs || []))
     .filter((p) => p.confidence > 50 && (p.text.match(/\p{L}/gu) || []).length >= 2);
 
+  if (g !== gen) return;
   send('status', 'Перевожу…');
   const texts = paras.map((p) => p.text.replace(/\s*\n\s*/g, ' ').trim());
   const res = [];
   if (S.engine === 'google') res.push(...(await Promise.allSettled(texts.map(translate))));
   else for (const t of texts) {
+    if (g !== gen) break;
     try { res.push({ status: 'fulfilled', value: await translate(t) }); } catch (e) { res.push({ status: 'rejected', reason: e }); }
   }
+  if (g !== gen) return;
   const fail = res.find((x) => x.status === 'rejected');
   const items = [];
   paras.forEach((p, i) => {
@@ -230,13 +289,13 @@ async function cycle() {
   });
   send('result', items);
   lastItems = items.length;
-  send('status', fail ? String(fail.reason.message || fail.reason).slice(0, 80) : '');
+  send('status', fail && fail.reason.message !== 'cancelled' ? String(fail.reason.message || fail.reason).slice(0, 80) : '');
 }
 
 async function tick() {
   if (!paused && !busy && !start && win && !win.isDestroyed() && win.isVisible()) {
     busy = true;
-    try { await cycle(); } catch (e) { prev = null; send('status', String(e.message || e).slice(0, 80)); }
+    try { await cycle(); } catch (e) { prev = null; if (e.message !== 'cancelled') send('status', String(e.message || e).slice(0, 80)); }
     busy = false;
   }
   setTimeout(tick, HIDE_MODE ? 1100 : 700);
@@ -250,6 +309,6 @@ app.whenReady().then(() => {
   globalShortcut.register('CommandOrControl+Shift+T', () => setPaused(!paused));
   globalShortcut.register('CommandOrControl+Shift+H', toggleVisible);
 });
-app.on('before-quit', save);
+app.on('before-quit', () => { save(); killChild(); });
 app.on('will-quit', () => globalShortcut.unregisterAll());
 app.on('window-all-closed', () => app.quit());

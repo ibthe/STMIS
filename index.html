@@ -13,6 +13,8 @@
   select{border:0;background:transparent;font:inherit;outline:none;cursor:pointer}
   .btn{width:24px;height:24px;border-radius:50%;background:#36393b;color:#fff;display:flex;align-items:center;justify-content:center;font-size:11px;cursor:pointer}
   #status{position:absolute;top:14px;left:215px;right:130px;color:#aeb4b8;font-size:11px;text-align:center;pointer-events:none;white-space:nowrap;overflow:hidden}
+  #bar{position:absolute;top:31px;left:215px;right:130px;height:3px;background:#55595c;border-radius:2px;display:none;overflow:hidden}
+  #bar i{display:block;height:100%;width:0;background:#4c9aff}
   #grip{position:absolute;right:5px;bottom:1px;color:#fff;font-size:12px;cursor:nwse-resize}
 </style></head>
 <body>
@@ -23,6 +25,7 @@
     <select id="tgt"><option value="ru">Русский</option><option value="en">English</option></select>
   </div>
   <div id="status"></div>
+  <div id="bar"><i></i></div>
   <div class="pill" id="btns">
     <div class="btn" id="eng" title="Движок: Google (онлайн)">G</div>
     <div class="btn" id="pz" title="Пауза (Ctrl/Cmd+Shift+T)">❚❚</div>
@@ -57,7 +60,13 @@ $('x').onclick=()=>api.close();
 api.on('init',s=>{engine=s.engine;paused=s.paused;$('src').value=s.src;$('tgt').value=s.tgt;showEng();showPause()});
 api.on('paused',p=>{paused=p;showPause();if(p)$('hole').innerHTML=''});
 api.on('hide',v=>{$('hole').style.visibility=v?'hidden':'visible'});
-api.on('status',t=>$('status').textContent=t);
+api.on('status',t=>{$('status').textContent=t;$('bar').style.display='none'});
+api.on('progress',p=>{
+  if(!p){$('bar').style.display='none';return}
+  $('status').textContent=p.text;
+  if(p.pct==null){$('bar').style.display='none';return}
+  $('bar').style.display='block';$('bar').firstChild.style.width=Math.min(100,Math.round(p.pct*100))+'%';
+});
 api.on('result',items=>{
   const h=$('hole');h.innerHTML='';
   for(const it of items){

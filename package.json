@@ -1,6 +1,6 @@
 {
   "name": "screen-translator",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "description": "Прозрачное окно поверх всех окон, которое переводит текст под собой",
   "main": "main.js",
   "scripts": { "start": "electron .", "dist": "electron-builder --publish never" },
@@ -19,7 +19,7 @@
     "artifactName": "ScreenTranslator-${version}-${os}-${arch}.${ext}",
     "asar": false,
     "afterPack": "afterPack.js",
-    "files": ["main.js", "preload.js", "index.html", "tray.png"],
+    "files": ["main.js", "translator.js", "preload.js", "index.html", "tray.png"],
     "win": { "target": ["portable"] },
     "mac": { "target": ["dmg", "zip"], "category": "public.app-category.utilities" }
   }
