@@ -7,3 +7,8 @@
 - Хоткеи: `Ctrl/Cmd+Shift+T` — пауза, `Ctrl/Cmd+Shift+H` — скрыть/показать.
 - Mac: разрешить «Запись экрана»; при «повреждено»: `xattr -cr "/Applications/Screen Translator.app"`.
 - Релиз: `git tag v0.3.0 && git push origin v0.3.0` — файлы появятся в Releases.
+
+## macOS: разрешение «Запись экрана»
+Если после обновления приложение снова просит разрешение, один раз выполните в Терминале:
+`tccutil reset ScreenCapture com.example.screentranslator`
+затем запустите приложение и разрешите запись экрана. Дальше разрешение сохраняется и между новыми сборками.

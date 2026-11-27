@@ -1,6 +1,6 @@
 {
   "name": "screen-translator",
-  "version": "0.3.1",
+  "version": "0.3.2",
   "description": "Прозрачное окно поверх всех окон, которое переводит текст под собой",
   "main": "main.js",
   "scripts": { "start": "electron .", "dist": "electron-builder --publish never" },
