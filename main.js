@@ -1,24 +1,26 @@
-const { app, BrowserWindow, ipcMain, desktopCapturer, screen, globalShortcut, Tray, Menu, nativeImage } = require('electron');
+const { app, BrowserWindow, ipcMain, desktopCapturer, screen, globalShortcut, Tray, Menu, nativeImage,
+        systemPreferences, utilityProcess, shell } = require('electron');
 const path = require('path');
 const fs = require('fs');
 const os = require('os');
-const { systemPreferences, utilityProcess, shell } = require('electron');
+try { os.setPriority(0, os.constants.priority.PRIORITY_BELOW_NORMAL); } catch (e) {} // не мешаем остальным программам
 
 const HEADER = 44, BORDER = 14; // должны совпадать с index.html
 const OCR = { en: 'eng', ru: 'rus', de: 'deu', fr: 'fra', es: 'spa', zh: 'chi_sim', ja: 'jpn' };
 const AUTO_OCR = ['eng', 'rus', 'deu', 'fra', 'spa'];
 const FRANC = { eng: 'en', rus: 'ru', deu: 'de', fra: 'fr', spa: 'es', cmn: 'zh', jpn: 'ja' };
-const S = { engine: 'google', src: 'en', tgt: 'ru', bounds: null };
-let win, tray, paused = false, busy = false, prev = null, start = null, lastItems = 0, askedPerm = false, gen = 0;
-// macOS 15+ (Darwin 24+): ScreenCaptureKit игнорирует скрытие окна от захвата -> прячем перевод на момент снимка
-const hideMode = () => process.platform === 'darwin' && parseInt(os.release(), 10) >= 24 && !S.legacyCapture;
-const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+const S = { engine: 'google', src: 'en', tgt: 'ru', offlineModel: 'opus', legacyCapture: false, bounds: null };
+let win, tray, paused = false, busy = false, prev = null, lastSig = null, movingSince = 0, idle = 0;
+let start = null, lastItems = 0, gen = 0;
 const send = (ch, d) => win && !win.isDestroyed() && win.webContents.send(ch, d);
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+// macOS 15+: ScreenCaptureKit игнорирует скрытие окна от захвата -> прячем перевод на момент снимка
+const hideMode = () => process.platform === 'darwin' && parseInt(os.release(), 10) >= 24 && !S.legacyCapture;
 
 // ---------- настройки ----------
 const SF = () => path.join(app.getPath('userData'), 'settings.json');
-function load() { try { Object.assign(S, JSON.parse(fs.readFileSync(SF(), 'utf8'))); } catch {} }
-function save() { try { if (win) S.bounds = win.getBounds(); fs.writeFileSync(SF(), JSON.stringify(S)); } catch {} }
+function load() { try { Object.assign(S, JSON.parse(fs.readFileSync(SF(), 'utf8'))); } catch (e) {} }
+function save() { try { if (win) S.bounds = win.getBounds(); fs.writeFileSync(SF(), JSON.stringify(S)); } catch (e) {} }
 
 // ---------- окно ----------
 function createWindow() {
@@ -53,6 +55,10 @@ function toggleVisible() {
   if (win.isVisible()) win.hide(); else win.showInactive();
   prev = null; refreshMenu();
 }
+function setModel(m) {
+  S.offlineModel = m; save(); gen++; cancelPending(); prev = null;
+  send('progress', null); send('status', ''); refreshMenu();
+}
 
 function buildTray() {
   const icon = nativeImage.createFromPath(path.join(__dirname, 'tray.png')).resize({ width: 18, height: 18 });
@@ -66,6 +72,10 @@ function refreshMenu() {
   tray.setContextMenu(Menu.buildFromTemplate([
     { label: win.isVisible() ? 'Скрыть окно' : 'Показать окно', click: toggleVisible },
     { label: paused ? 'Продолжить перевод' : 'Пауза', click: () => setPaused(!paused) },
+    { label: 'Офлайн-модель', submenu: [
+      { label: 'Быстрая (Opus-MT, ~150 МБ на пару)', type: 'radio', checked: S.offlineModel !== 'nllb', click: () => setModel('opus') },
+      { label: 'Точнее (NLLB, ~600 МБ, медленнее)', type: 'radio', checked: S.offlineModel === 'nllb', click: () => setModel('nllb') },
+    ] },
     ...(process.platform === 'darwin' ? [{
       label: 'Настройки записи экрана…',
       click: () => shell.openExternal('x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture'),
@@ -90,11 +100,14 @@ ipcMain.on('set', (_, s) => { Object.assign(S, s); prev = null; save(); gen++; c
 ipcMain.on('pause', (_, p) => setPaused(p));
 ipcMain.on('close', () => app.quit());
 
+// доля заметно изменившихся пикселей (ловит и смену одной строки текста)
 function differs(a, b) {
-  if (a.length !== b.length) return true;
-  let d = 0;
-  for (let i = 0; i < a.length; i += 4) d += Math.abs(a[i] - b[i]) + Math.abs(a[i + 1] - b[i + 1]) + Math.abs(a[i + 2] - b[i + 2]);
-  return d / (a.length / 4) > 6;
+  if (!a || !b || a.length !== b.length) return true;
+  let n = 0;
+  for (let i = 0; i < a.length; i += 4) {
+    if (Math.abs(a[i] - b[i]) + Math.abs(a[i + 1] - b[i + 1]) + Math.abs(a[i + 2] - b[i + 2]) > 48) n++;
+  }
+  return n > (a.length / 4) * 0.003;
 }
 
 // ---------- OCR ----------
@@ -121,9 +134,27 @@ async function getWorker() {
   return worker;
 }
 
+// чистим типичный мусор OCR: переносы, лишние пробелы, символы по краям
+function clean(t) {
+  return t.replace(/(\p{L})-\s*\n\s*(\p{Ll})/gu, '$1$2').replace(/\s*\n\s*/g, ' ').replace(/\s{2,}/g, ' ')
+    .replace(/^[^\p{L}\p{N}«"'(\[]+/u, '').replace(/[^\p{L}\p{N}.,!?:;»"')\]%…]+$/u, '').trim();
+}
+const letterRatio = (t) => (t.match(/\p{L}/gu) || []).length / Math.max(1, t.replace(/\s/g, '').length);
+
+// светлый текст на тёмном фоне Tesseract читает хуже -> инвертируем тёмные кадры
+function prepare(img) {
+  const { width, height } = img.getSize();
+  const buf = Buffer.from(img.toBitmap());
+  let sum = 0, n = 0;
+  for (let i = 0; i < buf.length; i += 64) { sum += (buf[i] + buf[i + 1] + buf[i + 2]) / 3; n++; }
+  if (n && sum / n < 110) for (let i = 0; i < buf.length; i += 4) { buf[i] = 255 - buf[i]; buf[i + 1] = 255 - buf[i + 1]; buf[i + 2] = 255 - buf[i + 2]; }
+  return nativeImage.createFromBitmap(buf, { width, height });
+}
+
 // ---------- перевод ----------
 async function google(text) {
-  const url = `https://translate.googleapis.com/translate_a/single?client=gtx&sl=auto&tl=${S.tgt}&dt=t&q=${encodeURIComponent(text)}`;
+  const sl = S.src === 'auto' ? 'auto' : (S.src === 'zh' ? 'zh-CN' : S.src);
+  const url = `https://translate.googleapis.com/translate_a/single?client=gtx&sl=${sl}&tl=${S.tgt === 'zh' ? 'zh-CN' : S.tgt}&dt=t&q=${encodeURIComponent(text)}`;
   const r = await fetch(url);
   if (!r.ok) throw new Error('Google: HTTP ' + r.status);
   const j = await r.json();
@@ -146,7 +177,7 @@ function ensureChild() {
   const c = child = utilityProcess.fork(path.join(__dirname, 'translator.js'));
   c.on('message', (m) => {
     if (m.type) {
-      for (const p of pending.values()) p.arm(); // есть признаки жизни — сбрасываем таймер зависания
+      for (const p of pending.values()) p.arm(); // признаки жизни — сбрасываем таймер зависания
       if (S.engine !== 'offline') return;
       if (m.type === 'progress') send('progress', { text: `Загрузка модели ${m.key}: ${mb(m.loaded)} / ${mb(m.total)} МБ`, pct: m.loaded / m.total });
       else if (m.type === 'loading') send('progress', { text: `Загрузка модели ${m.key}…`, pct: null });
@@ -177,7 +208,7 @@ function callWorker(text, s, t) {
       }, 60000);
     };
     pending.set(id, p); p.arm();
-    ensureChild().postMessage({ id, text, s, t, host: HOSTS[hostIdx], cacheDir: path.join(app.getPath('userData'), 'models') });
+    ensureChild().postMessage({ id, text, s, t, model: S.offlineModel, host: HOSTS[hostIdx], cacheDir: path.join(app.getPath('userData'), 'models') });
   });
 }
 async function step(text, s, t) {
@@ -202,13 +233,13 @@ async function offline(text) {
   const t = S.tgt;
   const s = S.src === 'auto' ? (await detect(text)) || 'en' : S.src;
   if (s === t) return text;
-  if (s === 'en' || t === 'en') return step(text, s, t);
-  return step(await step(text, s, 'en'), 'en', t); // через английский
+  if (S.offlineModel === 'nllb' || s === 'en' || t === 'en') return step(text, s, t);
+  return step(await step(text, s, 'en'), 'en', t); // Opus-MT: через английский
 }
 
 const cache = new Map();
 async function translate(text) {
-  const key = `${S.engine}|${S.src}|${S.tgt}|${text}`;
+  const key = `${S.engine}|${S.offlineModel}|${S.src}|${S.tgt}|${text}`;
   if (cache.has(key)) return cache.get(key);
   const out = S.engine === 'google' ? await google(text) : await offline(text);
   if (cache.size > 500) cache.clear();
@@ -216,73 +247,83 @@ async function translate(text) {
   return out;
 }
 
-// светлый текст на тёмном фоне Tesseract читает хуже -> инвертируем тёмные кадры
-function prepare(img) {
-  const { width, height } = img.getSize();
-  const buf = Buffer.from(img.toBitmap());
-  let sum = 0, n = 0;
-  for (let i = 0; i < buf.length; i += 64) { sum += (buf[i] + buf[i + 1] + buf[i + 2]) / 3; n++; }
-  if (n && sum / n < 110) for (let i = 0; i < buf.length; i += 4) { buf[i] = 255 - buf[i]; buf[i + 1] = 255 - buf[i + 1]; buf[i + 2] = 255 - buf[i + 2]; }
-  return nativeImage.createFromBitmap(buf, { width, height });
-}
-
-// ---------- основной цикл ----------
-async function cycle() {
-  const g = gen;
-  const b = win.getBounds();
-  const d = screen.getDisplayMatching(b), sf = d.scaleFactor;
-  const access = process.platform === 'darwin' ? systemPreferences.getMediaAccessStatus('screen') : 'granted';
+// ---------- захват экрана ----------
+// scale — пикселей на DIP: маленький для дешёвой проверки «изменилось ли», родной (sf) для OCR
+async function grab(d, b, scale) {
   const hide = hideMode() && lastItems > 0;
   if (hide) { send('hide', true); await sleep(90); }
   let srcs;
   try {
     srcs = await desktopCapturer.getSources({
       types: ['screen'],
-      thumbnailSize: { width: Math.round(d.size.width * sf), height: Math.round(d.size.height * sf) },
+      thumbnailSize: { width: Math.round(d.size.width * scale), height: Math.round(d.size.height * scale) },
     });
   } finally { if (hide) send('hide', false); }
   const s = srcs.find((x) => x.display_id === String(d.id)) || srcs[0];
-  if (!s) return;
-  const full = s.thumbnail, fs_ = full.getSize();
+  if (!s) return null;
+  const fs_ = s.thumbnail.getSize();
   const r = {
-    x: Math.max(0, Math.round((b.x - d.bounds.x + BORDER) * sf)),
-    y: Math.max(0, Math.round((b.y - d.bounds.y + HEADER) * sf)),
-    width: Math.round((b.width - 2 * BORDER) * sf),
-    height: Math.round((b.height - HEADER - BORDER) * sf),
+    x: Math.max(0, Math.round((b.x - d.bounds.x + BORDER) * scale)),
+    y: Math.max(0, Math.round((b.y - d.bounds.y + HEADER) * scale)),
+    width: Math.round((b.width - 2 * BORDER) * scale),
+    height: Math.round((b.height - HEADER - BORDER) * scale),
   };
   r.width = Math.min(r.width, fs_.width - r.x);
   r.height = Math.min(r.height, fs_.height - r.y);
-  if (r.width < 20 || r.height < 20) return;
+  if (r.width < 10 || r.height < 10) return null;
+  return s.thumbnail.crop(r);
+}
 
-  const img = full.crop(r);
-  const sig = img.resize({ width: 64 }).toBitmap();
-  if (prev && !differs(prev, sig)) return;
+// возвращает true, если была работа (для адаптивной частоты опроса)
+async function cycle() {
+  const g = gen;
+  const b = win.getBounds();
+  const d = screen.getDisplayMatching(b), sf = d.scaleFactor;
+  const access = process.platform === 'darwin' ? systemPreferences.getMediaAccessStatus('screen') : 'granted';
+
+  // 1) дешёвый снимок: изменилось ли что-то под окном
+  const small = await grab(d, b, 0.33);
+  if (!small) return false;
+  const sig = Buffer.from(small.toBitmap());
+  if (prev && !differs(prev, sig)) { lastSig = sig; return false; }
+  // 2) ждём, пока картинка «устоится»; если меняется постоянно (видео) — обрабатываем не чаще раза в 4 с
+  const moving = lastSig && differs(lastSig, sig);
+  lastSig = sig;
+  if (moving) {
+    movingSince = movingSince || Date.now();
+    if (Date.now() - movingSince < 4000) return true;
+  }
+  movingSince = 0;
   prev = sig;
-  if (S.src === S.tgt) return send('result', []);
+  if (S.src === S.tgt) { send('result', []); lastItems = 0; return true; }
 
-  // мелкий текст распознаётся заметно лучше после увеличения
-  const ocrImg = prepare(sf < 2 ? img.resize({ width: r.width * 2, quality: 'best' }) : img);
-  const k = ocrImg.getSize().width / (b.width - 2 * BORDER); // px картинки -> CSS-px
+  // 3) полный снимок + OCR + перевод
+  const img = await grab(d, b, sf);
+  if (!img) return true;
+  const up = sf >= 2 ? 1 : 1.5; // мелкий текст читается лучше после увеличения
+  const ocrImg = prepare(up > 1 ? img.resize({ width: Math.round(img.getSize().width * up), quality: 'best' }) : img);
+  const k = ocrImg.getSize().width / (img.getSize().width / sf); // px картинки -> CSS-px
 
   const w = await getWorker();
   send('status', 'Распознаю…');
   const { data } = await w.recognize(ocrImg.toPNG(), {}, { blocks: true });
-  const paras = (data.paragraphs || (data.blocks || []).flatMap((x) => x.paragraphs || []))
-    .filter((p) => p.confidence > 50 && (p.text.match(/\p{L}/gu) || []).length >= 2);
+  const found = (data.paragraphs || (data.blocks || []).flatMap((x) => x.paragraphs || []))
+    .map((p) => ({ p, text: clean(p.text) }))
+    .filter(({ p, text }) => p.confidence > 50 && (text.match(/\p{L}/gu) || []).length >= 2 && letterRatio(text) > 0.5);
+  if (g !== gen) return true;
 
-  if (g !== gen) return;
   send('status', 'Перевожу…');
-  const texts = paras.map((p) => p.text.replace(/\s*\n\s*/g, ' ').trim());
+  const texts = found.map((x) => x.text);
   const res = [];
   if (S.engine === 'google') res.push(...(await Promise.allSettled(texts.map(translate))));
   else for (const t of texts) {
     if (g !== gen) break;
     try { res.push({ status: 'fulfilled', value: await translate(t) }); } catch (e) { res.push({ status: 'rejected', reason: e }); }
   }
-  if (g !== gen) return;
+  if (g !== gen) return true;
   const fail = res.find((x) => x.status === 'rejected');
   const items = [];
-  paras.forEach((p, i) => {
+  found.forEach(({ p }, i) => {
     if (res[i].status !== 'fulfilled' || !res[i].value) return;
     items.push({
       x: p.bbox.x0 / k, y: p.bbox.y0 / k, w: (p.bbox.x1 - p.bbox.x0) / k, h: (p.bbox.y1 - p.bbox.y0) / k,
@@ -295,15 +336,19 @@ async function cycle() {
   let msg = fail && fail.reason.message !== 'cancelled' ? String(fail.reason.message || fail.reason).slice(0, 80) : '';
   if (!msg && !items.length && access !== 'granted') msg = `Текста нет. Если он есть — проверьте запись экрана (статус: ${access})`;
   send('status', msg);
+  return true;
 }
 
 async function tick() {
+  let worked = false;
   if (!paused && !busy && !start && win && !win.isDestroyed() && win.isVisible()) {
     busy = true;
-    try { await cycle(); } catch (e) { prev = null; if (e.message !== 'cancelled') send('status', String(e.message || e).slice(0, 80)); }
+    try { worked = await cycle(); } catch (e) { prev = null; if (e.message !== 'cancelled') send('status', String(e.message || e).slice(0, 80)); }
     busy = false;
   }
-  setTimeout(tick, hideMode() ? 1100 : 700);
+  idle = worked ? 0 : idle + 1;
+  const base = hideMode() ? 1200 : 800;
+  setTimeout(tick, paused || idle > 8 ? base * 2 : base); // чем дольше ничего не меняется, тем реже опрос
 }
 
 if (!app.requestSingleInstanceLock()) app.quit();
