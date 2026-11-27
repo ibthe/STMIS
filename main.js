@@ -2,9 +2,9 @@ const { app, BrowserWindow, ipcMain, desktopCapturer, screen, globalShortcut, Tr
 const path = require('path');
 const fs = require('fs');
 const os = require('os');
-const { systemPreferences, utilityProcess } = require('electron');
+const { systemPreferences, utilityProcess, shell } = require('electron');
 
-const HEADER = 49, BORDER = 17; // должны совпадать с index.html
+const HEADER = 44, BORDER = 14; // должны совпадать с index.html
 const OCR = { en: 'eng', ru: 'rus', de: 'deu', fr: 'fra', es: 'spa', zh: 'chi_sim', ja: 'jpn' };
 const AUTO_OCR = ['eng', 'rus', 'deu', 'fra', 'spa'];
 const FRANC = { eng: 'en', rus: 'ru', deu: 'de', fra: 'fr', spa: 'es', cmn: 'zh', jpn: 'ja' };
@@ -28,7 +28,7 @@ function createWindow() {
     return cx >= d.bounds.x && cx < d.bounds.x + d.bounds.width && cy >= d.bounds.y && cy < d.bounds.y + d.bounds.height;
   });
   win = new BrowserWindow({
-    width: 795, height: 253, ...(ok ? bb : {}), minWidth: 400, minHeight: 150,
+    width: 760, height: 260, ...(ok ? bb : {}), minWidth: 360, minHeight: 140,
     transparent: true, frame: false, hasShadow: false, alwaysOnTop: true,
     webPreferences: { preload: path.join(__dirname, 'preload.js'), contextIsolation: true },
   });
@@ -67,6 +67,9 @@ function refreshMenu() {
     { label: win.isVisible() ? 'Скрыть окно' : 'Показать окно', click: toggleVisible },
     { label: paused ? 'Продолжить перевод' : 'Пауза', click: () => setPaused(!paused) },
     ...(process.platform === 'darwin' ? [{
+      label: 'Настройки записи экрана…',
+      click: () => shell.openExternal('x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture'),
+    }, {
       label: 'Совместимый захват экрана (перезапуск)', type: 'checkbox', checked: !!S.legacyCapture,
       click: () => { S.legacyCapture = !S.legacyCapture; save(); app.relaunch(); app.exit(0); },
     }] : []),
@@ -81,7 +84,7 @@ ipcMain.on('drag', (_, m) => {
   if (m.phase === 'end') { start = null; prev = null; save(); return; }
   if (!start) return;
   if (m.mode === 'move') win.setBounds({ ...start, x: start.x + m.dx, y: start.y + m.dy });
-  else win.setBounds({ ...start, width: Math.max(400, start.width + m.dx), height: Math.max(150, start.height + m.dy) });
+  else win.setBounds({ ...start, width: Math.max(360, start.width + m.dx), height: Math.max(140, start.height + m.dy) });
 });
 ipcMain.on('set', (_, s) => { Object.assign(S, s); prev = null; save(); gen++; cancelPending(); send('progress', null); send('status', ''); });
 ipcMain.on('pause', (_, p) => setPaused(p));
@@ -228,11 +231,7 @@ async function cycle() {
   const g = gen;
   const b = win.getBounds();
   const d = screen.getDisplayMatching(b), sf = d.scaleFactor;
-  if (process.platform === 'darwin' && systemPreferences.getMediaAccessStatus('screen') !== 'granted') {
-    send('status', 'Нужно разрешение «Запись экрана» (Настройки → Конфиденциальность), затем перезапустите');
-    if (!askedPerm) { askedPerm = true; await desktopCapturer.getSources({ types: ['screen'], thumbnailSize: { width: 1, height: 1 } }); }
-    return;
-  }
+  const access = process.platform === 'darwin' ? systemPreferences.getMediaAccessStatus('screen') : 'granted';
   const hide = hideMode() && lastItems > 0;
   if (hide) { send('hide', true); await sleep(90); }
   let srcs;
@@ -293,7 +292,9 @@ async function cycle() {
   });
   send('result', items);
   lastItems = items.length;
-  send('status', fail && fail.reason.message !== 'cancelled' ? String(fail.reason.message || fail.reason).slice(0, 80) : '');
+  let msg = fail && fail.reason.message !== 'cancelled' ? String(fail.reason.message || fail.reason).slice(0, 80) : '';
+  if (!msg && !items.length && access !== 'granted') msg = `Текста нет. Если он есть — проверьте запись экрана (статус: ${access})`;
+  send('status', msg);
 }
 
 async function tick() {
