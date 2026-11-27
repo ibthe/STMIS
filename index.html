@@ -65,6 +65,7 @@ $('x').onclick=()=>api.close();
 
 api.on('init',s=>{engine=s.engine;paused=s.paused;$('src').value=s.src;$('tgt').value=s.tgt;showEng();showPause()});
 api.on('paused',p=>{paused=p;showPause();if(p)$('hole').innerHTML=''});
+api.on('selftest',on=>{$('hole').style.background=on?'#ff00ff':''});
 api.on('hide',v=>{$('hole').style.visibility=v?'hidden':'visible'});
 api.on('status',t=>{$('status').textContent=t;$('bar').style.display='none'});
 api.on('progress',p=>{
