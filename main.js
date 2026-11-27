@@ -16,9 +16,14 @@ let forceOnce = false, moveWait = 4000;
 const stat = { grab: 0, ocr: 0, tr: 0, runs: 0, polls: 0 };
 const send = (ch, d) => win && !win.isDestroyed() && win.webContents.send(ch, d);
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+// macOS: помощник (ScreenCaptureKit) снимает экран без нашего окна -> перевод не мигает и не читает сам себя
+const { execFile } = require('child_process');
+const helperPath = path.join(process.resourcesPath || '', 'capture');
+let helperBroken = false, helperFails = 0;
+const useHelper = () => process.platform === 'darwin' && !helperBroken && fs.existsSync(helperPath);
 // macOS 15+: ScreenCaptureKit игнорирует скрытие окна от захвата -> прячем перевод на момент снимка
 // Определяется самотестом при запуске (selfTest): видит ли захват экрана само окно приложения
-const hideMode = () => S.capturesSelf !== undefined
+const hideMode = () => useHelper() ? false : S.capturesSelf !== undefined
   ? !!S.capturesSelf
   : process.platform === 'darwin' && parseInt(os.release(), 10) >= 24 && !S.legacyCapture;
 
@@ -84,6 +89,10 @@ async function selfTest() {
     const bm = img.toBitmap(), i = ((height >> 1) * width + (width >> 1)) * 4;
     S.capturesSelf = bm[i] > 200 && bm[i + 1] < 90 && bm[i + 2] > 200;
     save();
+    // macOS: окно попадает в захват -> один раз пробуем «совместимый» режим захвата
+    if (S.capturesSelf && process.platform === 'darwin' && !S.legacyCapture && !S.legacyTried && !useHelper()) {
+      S.legacyTried = true; S.legacyCapture = true; save(); app.relaunch(); app.exit(0);
+    }
   } catch (e) { send('selftest', false); }
 }
 
@@ -95,7 +104,7 @@ async function diag() {
     type: 'info', title: 'Диагностика', message: 'Screen Translator ' + app.getVersion(),
     detail: [
       `ОС: ${process.platform} ${os.release()}, Electron ${process.versions.electron}`,
-      `Окно попадает в захват: ${S.capturesSelf === undefined ? 'не проверено' : S.capturesSelf ? 'да (перевод прячется на момент снимка)' : 'нет'}`,
+      `Захват: ${useHelper() ? 'помощник ScreenCaptureKit (без окна приложения)' : 'стандартный'}\n  окно попадает в захват: ${S.capturesSelf === undefined ? 'не проверено' : S.capturesSelf ? 'да (перевод прячется на момент снимка)' : 'нет'}`,
       `Режим: ${S.auto === false ? 'по горячей клавише' : 'авто'}, движок: ${S.engine}, язык: ${S.src} → ${S.tgt}, модель: ${S.offlineModel}`,
       `Проверок экрана: ${stat.polls}, среднее ${Math.round(stat.grab / n)} мс`,
       `Распознаваний: ${stat.runs}, OCR в среднем ${Math.round(stat.ocr / r)} мс, перевод ${Math.round(stat.tr / r)} мс`,
@@ -296,9 +305,26 @@ async function translate(text) {
 
 // ---------- захват экрана ----------
 // scale — пикселей на DIP: маленький для дешёвой проверки «изменилось ли», родной (sf) для OCR
+function helperGrab(d, b, scale) {
+  const out = path.join(os.tmpdir(), `st-${process.pid}-${scale > 0.5 ? 'f' : 's'}.png`);
+  const w = b.width - 2 * BORDER, h = b.height - HEADER - BORDER;
+  const args = [d.id, b.x - d.bounds.x + BORDER, b.y - d.bounds.y + HEADER, w, h,
+    Math.max(8, Math.round(w * scale)), Math.max(8, Math.round(h * scale)), process.pid, out].map(String);
+  return new Promise((resolve) => execFile(helperPath, args, { timeout: 8000 }, (err) => {
+    if (err) return resolve(null);
+    const img = nativeImage.createFromPath(out);
+    resolve(img.isEmpty() ? null : img);
+  }));
+}
+
 async function grab(d, b, scale, noHide) {
+  if (useHelper()) {
+    const img = await helperGrab(d, b, scale);
+    if (img) { helperFails = 0; return img; }
+    if (++helperFails >= 3) { helperBroken = true; S.capturesSelf = true; } // помощник не работает -> обычный путь
+  }
   const hide = !noHide && hideMode() && lastItems > 0;
-  if (hide) { send('hide', true); await sleep(90); }
+  if (hide) { send('hide', true); await sleep(140); }
   let srcs;
   try {
     srcs = await desktopCapturer.getSources({
@@ -403,7 +429,7 @@ async function tick() {
     busy = false;
   }
   idle = worked ? 0 : idle + 1;
-  const base = hideMode() ? 1200 : 800;
+  const base = hideMode() ? (lastItems > 0 ? 3000 : 1200) : 800; // в режиме «прятать перевод» опрашиваем реже, чтобы он не мигал
   setTimeout(tick, paused || idle > 8 ? base * 2 : base); // чем дольше ничего не меняется, тем реже опрос
 }
 

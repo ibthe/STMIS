@@ -17,6 +17,10 @@ jobs:
         with:
           node-version: 20
       - run: npm install
+      - name: Build native capture helper (macOS)
+        if: runner.os == 'macOS'
+        continue-on-error: true
+        run: swiftc -O -parse-as-library -target arm64-apple-macos14.0 native/capture.swift -o native/capture
       - run: node --check main.js && node --check preload.js
       - run: npx electron-builder --publish never
         env:

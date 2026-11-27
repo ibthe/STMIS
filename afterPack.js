@@ -4,6 +4,7 @@ exports.default = async (ctx) => {
   if (ctx.electronPlatformName !== 'darwin') return;
   const app = path.join(ctx.appOutDir, `${ctx.packager.appInfo.productFilename}.app`);
   const id = ctx.packager.appInfo.id;
+  try { execSync(`codesign --force --sign - "${path.join(app, 'Contents', 'Resources', 'capture')}"`, { stdio: 'inherit' }); } catch (e) {}
   // 1) подписываем все вложенные части (ad-hoc)
   execSync(`codesign --force --deep --sign - "${app}"`, { stdio: 'inherit' });
   // 2) переподписываем сам пакет с постоянным requirement: тогда macOS считает
