@@ -1,15 +1,29 @@
-const { app, BrowserWindow, ipcMain, desktopCapturer, screen } = require('electron');
+const { app, BrowserWindow, ipcMain, desktopCapturer, screen, globalShortcut, Tray, Menu, nativeImage } = require('electron');
 const path = require('path');
+const fs = require('fs');
 
 const HEADER = 44, BORDER = 14; // должны совпадать с index.html
 const OCR = { en: 'eng', ru: 'rus', de: 'deu', fr: 'fra', es: 'spa', zh: 'chi_sim', ja: 'jpn' };
-const S = { engine: 'google', src: 'en', tgt: 'ru' };
-let win, paused = false, busy = false, prev = null, start = null;
+const AUTO_OCR = ['eng', 'rus', 'deu', 'fra', 'spa'];
+const FRANC = { eng: 'en', rus: 'ru', deu: 'de', fra: 'fr', spa: 'es', cmn: 'zh', jpn: 'ja' };
+const S = { engine: 'google', src: 'en', tgt: 'ru', bounds: null };
+let win, tray, paused = false, busy = false, prev = null, start = null;
 const send = (ch, d) => win && !win.isDestroyed() && win.webContents.send(ch, d);
 
+// ---------- настройки ----------
+const SF = () => path.join(app.getPath('userData'), 'settings.json');
+function load() { try { Object.assign(S, JSON.parse(fs.readFileSync(SF(), 'utf8'))); } catch {} }
+function save() { try { if (win) S.bounds = win.getBounds(); fs.writeFileSync(SF(), JSON.stringify(S)); } catch {} }
+
+// ---------- окно ----------
 function createWindow() {
+  const bb = S.bounds;
+  const ok = bb && screen.getAllDisplays().some((d) => {
+    const cx = bb.x + bb.width / 2, cy = bb.y + bb.height / 2;
+    return cx >= d.bounds.x && cx < d.bounds.x + d.bounds.width && cy >= d.bounds.y && cy < d.bounds.y + d.bounds.height;
+  });
   win = new BrowserWindow({
-    width: 760, height: 260, minWidth: 360, minHeight: 140,
+    width: 760, height: 260, ...(ok ? bb : {}), minWidth: 360, minHeight: 140,
     transparent: true, frame: false, hasShadow: false, alwaysOnTop: true,
     webPreferences: { preload: path.join(__dirname, 'preload.js'), contextIsolation: true },
   });
@@ -18,19 +32,50 @@ function createWindow() {
   win.setContentProtection(true); // окно не попадает в собственный захват экрана
   win.setIgnoreMouseEvents(true, { forward: true });
   win.loadFile('index.html');
-  win.webContents.once('did-finish-load', tick);
+  win.webContents.once('did-finish-load', () => {
+    send('init', { engine: S.engine, src: S.src, tgt: S.tgt, paused });
+    tick();
+  });
+}
+
+function setPaused(p) {
+  paused = p; prev = null;
+  send('paused', p);
+  if (p) send('result', []);
+  refreshMenu();
+}
+function toggleVisible() {
+  if (win.isVisible()) win.hide(); else win.showInactive();
+  prev = null; refreshMenu();
+}
+
+function buildTray() {
+  const icon = nativeImage.createFromPath(path.join(__dirname, 'tray.png')).resize({ width: 18, height: 18 });
+  tray = new Tray(icon);
+  tray.setToolTip('Screen Translator');
+  tray.on('click', toggleVisible);
+  refreshMenu();
+}
+function refreshMenu() {
+  if (!tray) return;
+  tray.setContextMenu(Menu.buildFromTemplate([
+    { label: win.isVisible() ? 'Скрыть окно' : 'Показать окно', click: toggleVisible },
+    { label: paused ? 'Продолжить перевод' : 'Пауза', click: () => setPaused(!paused) },
+    { type: 'separator' },
+    { label: 'Выход', click: () => app.quit() },
+  ]));
 }
 
 ipcMain.on('ignore', (_, v) => win.setIgnoreMouseEvents(v, { forward: true }));
 ipcMain.on('drag', (_, m) => {
   if (m.phase === 'start') { start = win.getBounds(); return; }
-  if (m.phase === 'end') { start = null; prev = null; return; }
+  if (m.phase === 'end') { start = null; prev = null; save(); return; }
   if (!start) return;
   if (m.mode === 'move') win.setBounds({ ...start, x: start.x + m.dx, y: start.y + m.dy });
   else win.setBounds({ ...start, width: Math.max(360, start.width + m.dx), height: Math.max(140, start.height + m.dy) });
 });
-ipcMain.on('set', (_, s) => { Object.assign(S, s); prev = null; });
-ipcMain.on('pause', (_, p) => { paused = p; prev = null; });
+ipcMain.on('set', (_, s) => { Object.assign(S, s); prev = null; save(); });
+ipcMain.on('pause', (_, p) => setPaused(p));
 ipcMain.on('close', () => app.quit());
 
 function differs(a, b) {
@@ -43,7 +88,7 @@ function differs(a, b) {
 // ---------- OCR ----------
 let worker = null, workerLang = '';
 async function getWorker() {
-  const langs = [...new Set([OCR[S.src], 'eng'])];
+  const langs = S.src === 'auto' ? AUTO_OCR : [...new Set([OCR[S.src], 'eng'])];
   const key = langs.join('+');
   if (worker && workerLang === key) return worker;
   if (worker) await worker.terminate();
@@ -54,7 +99,7 @@ async function getWorker() {
   return worker;
 }
 
-// ---------- Перевод ----------
+// ---------- перевод ----------
 async function google(text) {
   const url = `https://translate.googleapis.com/translate_a/single?client=gtx&sl=auto&tl=${S.tgt}&dt=t&q=${encodeURIComponent(text)}`;
   const r = await fetch(url);
@@ -82,13 +127,19 @@ async function step(text, s, t) {
   const out = await p(text, { max_new_tokens: 256 });
   return out[0].translation_text;
 }
+async function detect(text) {
+  const { franc } = await import('franc-min');
+  return FRANC[franc(text, { minLength: 10 })] || null;
+}
 async function offline(text) {
-  const { src: s, tgt: t } = S;
+  const t = S.tgt;
+  const s = S.src === 'auto' ? (await detect(text)) || 'en' : S.src;
+  if (s === t) return text;
   if (s === 'en' || t === 'en') return step(text, s, t);
   return step(await step(text, s, 'en'), 'en', t); // через английский
 }
 
-// ---------- Основной цикл ----------
+// ---------- основной цикл ----------
 async function cycle() {
   const b = win.getBounds();
   const d = screen.getDisplayMatching(b), sf = d.scaleFactor;
@@ -98,15 +149,15 @@ async function cycle() {
   });
   const s = srcs.find((x) => x.display_id === String(d.id)) || srcs[0];
   if (!s) return;
-  const full = s.thumbnail, fs = full.getSize();
+  const full = s.thumbnail, fs_ = full.getSize();
   const r = {
     x: Math.max(0, Math.round((b.x - d.bounds.x + BORDER) * sf)),
     y: Math.max(0, Math.round((b.y - d.bounds.y + HEADER) * sf)),
     width: Math.round((b.width - 2 * BORDER) * sf),
     height: Math.round((b.height - HEADER - BORDER) * sf),
   };
-  r.width = Math.min(r.width, fs.width - r.x);
-  r.height = Math.min(r.height, fs.height - r.y);
+  r.width = Math.min(r.width, fs_.width - r.x);
+  r.height = Math.min(r.height, fs_.height - r.y);
   if (r.width < 20 || r.height < 20) return;
 
   const img = full.crop(r);
@@ -115,14 +166,17 @@ async function cycle() {
   prev = sig;
   if (S.src === S.tgt) return send('result', []);
 
+  // мелкий текст распознаётся заметно лучше после увеличения
+  const ocrImg = sf < 2 ? img.resize({ width: r.width * 2, quality: 'best' }) : img;
+  const k = ocrImg.getSize().width / (b.width - 2 * BORDER); // px картинки -> CSS-px
+
   const w = await getWorker();
   send('status', 'Распознаю…');
-  const { data } = await w.recognize(img.toPNG(), {}, { blocks: true });
+  const { data } = await w.recognize(ocrImg.toPNG(), {}, { blocks: true });
   const paras = (data.paragraphs || (data.blocks || []).flatMap((x) => x.paragraphs || []))
     .filter((p) => p.confidence > 50 && p.text.trim().length > 1);
 
   send('status', 'Перевожу…');
-  const k = r.width / (b.width - 2 * BORDER); // пиксели картинки -> CSS-пиксели
   const texts = paras.map((p) => p.text.replace(/\s*\n\s*/g, ' ').trim());
   let out;
   if (S.engine === 'google') out = await Promise.all(texts.map(google));
@@ -137,7 +191,7 @@ async function cycle() {
 }
 
 async function tick() {
-  if (!paused && !busy && !start && win && !win.isDestroyed()) {
+  if (!paused && !busy && !start && win && !win.isDestroyed() && win.isVisible()) {
     busy = true;
     try { await cycle(); } catch (e) { prev = null; send('status', String(e.message || e).slice(0, 80)); }
     busy = false;
@@ -145,5 +199,14 @@ async function tick() {
   setTimeout(tick, 700);
 }
 
-app.whenReady().then(createWindow);
+if (!app.requestSingleInstanceLock()) app.quit();
+app.whenReady().then(() => {
+  load();
+  createWindow();
+  buildTray();
+  globalShortcut.register('CommandOrControl+Shift+T', () => setPaused(!paused));
+  globalShortcut.register('CommandOrControl+Shift+H', toggleVisible);
+});
+app.on('before-quit', save);
+app.on('will-quit', () => globalShortcut.unregisterAll());
 app.on('window-all-closed', () => app.quit());
