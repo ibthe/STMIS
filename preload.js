@@ -4,6 +4,8 @@ contextBridge.exposeInMainWorld('api', {
   drag: (m) => ipcRenderer.send('drag', m),
   set: (s) => ipcRenderer.send('set', s),
   pause: (p) => ipcRenderer.send('pause', p),
+  copy: (t) => ipcRenderer.send('copy', t),
+  copyAll: () => ipcRenderer.send('copyAll'),
   close: () => ipcRenderer.send('close'),
   on: (ch, f) => ipcRenderer.on(ch, (_, d) => f(d)),
 });

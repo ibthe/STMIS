@@ -7,7 +7,8 @@
   #hole{position:absolute;left:14px;right:14px;top:44px;bottom:14px;border-radius:22px;
         overflow:hidden}
   #fr{position:absolute;inset:0;width:100%;height:100%;pointer-events:none}
-  .tr{position:absolute;background:rgba(20,22,24,.9);color:#fff;border-radius:4px;padding:1px 3px;box-sizing:border-box;overflow:hidden;line-height:1.15}
+  .tr{position:absolute;background:rgba(20,22,24,.92);color:#fff;border-radius:4px;padding:1px 3px;box-sizing:border-box;overflow:hidden;line-height:1.15;user-select:text;-webkit-user-select:text;cursor:text}
+  .tr::selection{background:#4c9aff;color:#fff}
   .pill{position:absolute;top:6px;height:32px;background:#fff;border-radius:16px;display:flex;align-items:center;cursor:default}
   #langs{left:22px;padding:0 6px;gap:2px}
   #btns{right:22px;padding:0 4px;gap:4px}
@@ -37,7 +38,7 @@
 </div>
 <script>
 const B=14,H=44,$=(i)=>document.getElementById(i);
-let ignoring=true,drag=null,engine='google',paused=false;
+let ignoring=true,drag=null,engine='google',paused=false,overTr=false,selecting=false,pending=null;
 
 const rr=(x,y,w,h,r)=>`M${x+r},${y}H${x+w-r}A${r},${r} 0 0 1 ${x+w},${y+r}V${y+h-r}A${r},${r} 0 0 1 ${x+w-r},${y+h}H${x+r}A${r},${r} 0 0 1 ${x},${y+h-r}V${y+r}A${r},${r} 0 0 1 ${x+r},${y}Z`;
 function drawFrame(){const w=innerWidth,h=innerHeight;$('fp').setAttribute('d',rr(0,0,w,h,36)+rr(B,H,w-2*B,h-H-B,22))}
@@ -46,25 +47,52 @@ addEventListener('resize',drawFrame);drawFrame();
 window.addEventListener('mousemove',e=>{
   if(drag){api.drag({phase:'move',mode:drag.mode,dx:e.screenX-drag.x,dy:e.screenY-drag.y});return}
   const inHole=e.clientX>B&&e.clientX<innerWidth-B&&e.clientY>H&&e.clientY<innerHeight-B;
-  if(inHole!==ignoring){ignoring=inHole;api.ignore(inHole)}
+  overTr=!!(e.target.closest&&e.target.closest('.tr'));
+  const want=inHole&&!overTr&&!selecting; // над переводом окно ловит мышь (можно выделять), иначе пропускает клики
+  if(want!==ignoring){ignoring=want;api.ignore(want)}
+  flush();
 });
 $('frame').addEventListener('mousedown',e=>{
-  if(e.target.closest('select,.btn'))return;
+  if(e.target.closest('select,.btn,.tr'))return;
   const mode=e.target.closest('#grip')?'resize':'move';
   drag={mode,x:e.screenX,y:e.screenY};api.drag({phase:'start'});$('hole').innerHTML='';e.preventDefault();
 });
-window.addEventListener('mouseup',()=>{if(drag){drag=null;api.drag({phase:'end'})}});
+window.addEventListener('mouseup',()=>{if(drag){drag=null;api.drag({phase:'end'})}selecting=false;setTimeout(flush,0)});
+$('hole').addEventListener('mousedown',e=>{if(e.target.closest('.tr'))selecting=true});
+
+// выделение и копирование перевода
+const hasSel=()=>String(getSelection()).length>0;
+function render(items){
+  const h=$('hole');h.innerHTML='';
+  for(const it of items){
+    const d=document.createElement('div');d.className='tr';d.textContent=it.text;
+    let fs=Math.max(10,Math.min(it.lh*.8,30));
+    d.style.cssText+=`left:${it.x}px;top:${it.y}px;width:${it.w+8}px;min-height:${it.h}px;font-size:${fs}px`;
+    h.appendChild(d);
+    while(d.scrollHeight>it.h+6&&fs>9){fs-=1;d.style.fontSize=fs+'px'}
+  }
+}
+// пока пользователь выделяет/держит курсор над переводом, новый результат ждёт (иначе выделение пропадёт)
+function flush(){if(pending&&!(selecting||overTr||hasSel())){const p=pending;pending=null;render(p)}}
+document.addEventListener('selectionchange',flush);
+addEventListener('blur',()=>{getSelection().removeAllRanges();selecting=false;overTr=false;flush()});
+addEventListener('keydown',e=>{
+  if((e.ctrlKey||e.metaKey)&&!e.shiftKey&&!e.altKey&&e.key.toLowerCase()==='c'){
+    const t=String(getSelection());
+    if(t){api.copy(t);e.preventDefault()}
+  } else if(e.key==='Escape'){getSelection().removeAllRanges();flush()}
+});
 
 const showEng=()=>{$('eng').textContent=engine==='google'?'G':'⚡';$('eng').title=engine==='google'?'Google (онлайн)':'Офлайн-модель'};
 const showPause=()=>{$('pz').textContent=paused?'▶':'❚❚'};
-const push=()=>{$('hole').innerHTML='';api.set({engine,src:$('src').value,tgt:$('tgt').value})};
+const push=()=>{pending=null;getSelection().removeAllRanges();$('hole').innerHTML='';api.set({engine,src:$('src').value,tgt:$('tgt').value})};
 $('src').onchange=push;$('tgt').onchange=push;
 $('eng').onclick=()=>{engine=engine==='google'?'offline':'google';showEng();push()};
 $('pz').onclick=()=>api.pause(!paused);
 $('x').onclick=()=>api.close();
 
 api.on('init',s=>{engine=s.engine;paused=s.paused;$('src').value=s.src;$('tgt').value=s.tgt;showEng();showPause()});
-api.on('paused',p=>{paused=p;showPause();if(p)$('hole').innerHTML=''});
+api.on('paused',p=>{paused=p;showPause();if(p){pending=null;$('hole').innerHTML=''}});
 api.on('selftest',on=>{$('hole').style.background=on?'#ff00ff':''});
 api.on('hide',v=>{$('hole').style.visibility=v?'hidden':'visible'});
 api.on('status',t=>{$('status').textContent=t;$('bar').style.display='none'});
@@ -74,14 +102,5 @@ api.on('progress',p=>{
   if(p.pct==null){$('bar').style.display='none';return}
   $('bar').style.display='block';$('bar').firstChild.style.width=Math.min(100,Math.round(p.pct*100))+'%';
 });
-api.on('result',items=>{
-  const h=$('hole');h.innerHTML='';
-  for(const it of items){
-    const d=document.createElement('div');d.className='tr';d.textContent=it.text;
-    let fs=Math.max(10,Math.min(it.lh*.8,30));
-    d.style.cssText+=`left:${it.x}px;top:${it.y}px;width:${it.w+8}px;min-height:${it.h}px;font-size:${fs}px`;
-    h.appendChild(d);
-    while(d.scrollHeight>it.h+6&&fs>9){fs-=1;d.style.fontSize=fs+'px'}
-  }
-});
+api.on('result',items=>{pending=items;flush()});
 </script></body></html>
