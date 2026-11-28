@@ -83,11 +83,12 @@ addEventListener('keydown',e=>{
   } else if(e.key==='Escape'){getSelection().removeAllRanges();flush()}
 });
 
-const showEng=()=>{$('eng').textContent=engine==='google'?'G':'⚡';$('eng').title=engine==='google'?'Google (онлайн)':'Офлайн-модель'};
+const ENG={google:['G','Google (онлайн)'],llm:['AI','Нейросеть TranslateGemma (Ollama)']},ORDER=['google','llm'];
+const showEng=()=>{$('eng').textContent=ENG[engine][0];$('eng').title=ENG[engine][1]};
 const showPause=()=>{$('pz').textContent=paused?'▶':'❚❚'};
 const push=()=>{pending=null;getSelection().removeAllRanges();$('hole').innerHTML='';api.set({engine,src:$('src').value,tgt:$('tgt').value})};
 $('src').onchange=push;$('tgt').onchange=push;
-$('eng').onclick=()=>{engine=engine==='google'?'offline':'google';showEng();push()};
+$('eng').onclick=()=>{engine=ORDER[(ORDER.indexOf(engine)+1)%ORDER.length];showEng();push()};
 $('pz').onclick=()=>api.pause(!paused);
 $('x').onclick=()=>api.close();
 

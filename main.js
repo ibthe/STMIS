@@ -1,5 +1,5 @@
 const { app, BrowserWindow, ipcMain, desktopCapturer, screen, globalShortcut, Tray, Menu, nativeImage,
-        systemPreferences, utilityProcess, shell, dialog, clipboard } = require('electron');
+        systemPreferences, shell, dialog, clipboard } = require('electron');
 const path = require('path');
 const fs = require('fs');
 const os = require('os');
@@ -7,12 +7,10 @@ const { execFile, spawn } = require('child_process');
 try { os.setPriority(0, os.constants.priority.PRIORITY_BELOW_NORMAL); } catch (e) {}
 
 const HEADER = 44, BORDER = 14; // должны совпадать с index.html
-const TESS = { en: 'eng', ru: 'rus', de: 'deu', fr: 'fra', es: 'spa', zh: 'chi_sim', ja: 'jpn' };
-const AUTO_TESS = ['eng', 'rus'];
 const VISION = { en: 'en-US', ru: 'ru-RU', de: 'de-DE', fr: 'fr-FR', es: 'es-ES', zh: 'zh-Hans', ja: 'ja-JP' };
 const WINOCR = { en: 'en-US', ru: 'ru-RU', de: 'de-DE', fr: 'fr-FR', es: 'es-ES', zh: 'zh-Hans-CN', ja: 'ja-JP' };
 const FRANC = { eng: 'en', rus: 'ru', deu: 'de', fra: 'fr', spa: 'es', cmn: 'zh', jpn: 'ja' };
-const S = { auto: true, engine: 'google', src: 'en', tgt: 'ru', offlineModel: 'opus', legacyCapture: false, bounds: null };
+const S = { auto: true, engine: 'google', src: 'en', tgt: 'ru', llmModel: process.platform === 'win32' ? 'translategemma:12b' : 'translategemma:4b', legacyCapture: false, bounds: null };
 let win, tray, paused = false, busy = false, prev = null, lastSig = null, movingSince = 0, idle = 0;
 let start = null, lastItems = 0, lastTexts = [], gen = 0, forceOnce = false, moveWait = 4000;
 const stat = { grab: 0, ocr: 0, tr: 0, runs: 0, polls: 0, engine: '', err: '' };
@@ -26,8 +24,8 @@ let helperBroken = false, helperFails = 0, helperErr = '';
 const useHelper = () => process.platform === 'darwin' && !helperBroken && fs.existsSync(helperPath);
 // Windows: встроенный Windows OCR через постоянный процесс PowerShell (native/ocr.ps1)
 const psScript = () => [path.join(process.resourcesPath || '', 'ocr.ps1'), path.join(__dirname, 'native', 'ocr.ps1')].find((p) => fs.existsSync(p));
-let ps = null, psBuf = '', psWait = [], psBroken = false, psFails = 0;
-const useWinOcr = () => process.platform === 'win32' && !psBroken && !!psScript();
+let ps = null, psBuf = '', psWait = [];
+const useWinOcr = () => process.platform === 'win32' && !!psScript();
 
 // Определяется самотестом при запуске: видит ли захват экрана само окно приложения
 const hideMode = () => useHelper() ? false : S.capturesSelf !== undefined
@@ -71,7 +69,7 @@ function setPaused(p) {
   refreshMenu();
 }
 function toggleVisible() { if (win.isVisible()) win.hide(); else win.showInactive(); prev = null; refreshMenu(); }
-function setModel(m) { S.offlineModel = m; save(); gen++; cancelPending(); prev = null; send('progress', null); send('status', ''); refreshMenu(); }
+function setLlm(m) { S.llmModel = m; llmReady = ''; save(); gen++; prev = null; abortDownloads(); send('progress', null); send('status', ''); refreshMenu(); }
 function setAuto(v) { S.auto = v; save(); prev = null; refreshMenu(); }
 function force() { forceOnce = true; prev = null; }
 function copyAll() {
@@ -108,7 +106,7 @@ async function diag() {
       `ОС: ${process.platform} ${os.release()}, Electron ${process.versions.electron}`,
       `Захват: ${useHelper() ? 'помощник ScreenCaptureKit (без окна приложения)' : 'стандартный'}; окно попадает в захват: ${S.capturesSelf === undefined ? 'не проверено' : S.capturesSelf ? 'да' : 'нет'}`,
       `Распознавание: ${stat.engine || 'ещё не запускалось'}${stat.err ? '\nПоследняя ошибка OCR: ' + stat.err : ''}`,
-      `Режим: ${S.auto === false ? 'по горячей клавише' : 'авто'}, движок: ${S.engine}, язык: ${S.src} → ${S.tgt}, модель: ${S.offlineModel}`,
+      `Режим: ${S.auto === false ? 'по горячей клавише' : 'авто'}, движок: ${S.engine}, язык: ${S.src} → ${S.tgt}, AI: ${S.llmModel} (Ollama: ${ollamaProc ? 'запущена приложением' : 'внешняя/не запущена'})`,
       `Проверок экрана: ${stat.polls}, среднее ${Math.round(stat.grab / n)} мс`,
       `Распознаваний: ${stat.runs}, OCR в среднем ${Math.round(stat.ocr / r)} мс, перевод ${Math.round(stat.tr / r)} мс`,
       `Нагрузка процессов:`, cpu,
@@ -132,9 +130,9 @@ function refreshMenu() {
     { label: 'Автоперевод (иначе — по Ctrl/Cmd+Shift+Y)', type: 'checkbox', checked: S.auto !== false, click: () => setAuto(S.auto === false) },
     { label: 'Перевести сейчас', click: force },
     { label: 'Копировать весь перевод (Ctrl/Cmd+Alt+C)', click: copyAll },
-    { label: 'Офлайн-модель', submenu: [
-      { label: 'Быстрая (Opus-MT, ~150 МБ на пару)', type: 'radio', checked: S.offlineModel !== 'nllb', click: () => setModel('opus') },
-      { label: 'Точнее (NLLB, ~600 МБ, медленнее)', type: 'radio', checked: S.offlineModel === 'nllb', click: () => setModel('nllb') },
+    { label: 'AI-модель (Ollama, кнопка AI)', submenu: [
+      { label: 'TranslateGemma 4B (3.3 ГБ, быстрее)', type: 'radio', checked: S.llmModel === 'translategemma:4b', click: () => setLlm('translategemma:4b') },
+      { label: 'TranslateGemma 12B (8.1 ГБ, качественнее)', type: 'radio', checked: S.llmModel === 'translategemma:12b', click: () => setLlm('translategemma:12b') },
     ] },
     ...(process.platform === 'darwin' ? [{
       label: 'Настройки записи экрана…',
@@ -157,7 +155,7 @@ ipcMain.on('drag', (_, m) => {
   if (m.mode === 'move') win.setBounds({ ...start, x: start.x + m.dx, y: start.y + m.dy });
   else win.setBounds({ ...start, width: Math.max(360, start.width + m.dx), height: Math.max(140, start.height + m.dy) });
 });
-ipcMain.on('set', (_, s) => { Object.assign(S, s); prev = null; save(); gen++; cancelPending(); send('progress', null); send('status', ''); });
+ipcMain.on('set', (_, s) => { Object.assign(S, s); prev = null; save(); gen++; abortDownloads(); send('progress', null); send('status', ''); });
 ipcMain.on('pause', (_, p) => setPaused(p));
 ipcMain.on('copy', (_, t) => { clipboard.writeText(String(t)); send('status', 'Скопировано'); });
 ipcMain.on('copyAll', copyAll);
@@ -230,67 +228,31 @@ function psRequest(tag, file) {
   });
 }
 
-// 3) запасной вариант: Tesseract
-let worker = null, workerLang = '';
-async function getWorker() {
-  const langs = S.src === 'auto' ? AUTO_TESS : [...new Set([TESS[S.src], 'eng'])];
-  const key = langs.join('+');
-  if (worker && workerLang === key) return worker;
-  if (worker) await worker.terminate();
-  send('progress', { text: 'Загрузка языка OCR…', pct: null });
-  const { createWorker } = require('tesseract.js');
-  const make = createWorker(langs, 1, {
-    cachePath: app.getPath('userData'),
-    logger: (m) => {
-      if (String(m.status).startsWith('loading') && typeof m.progress === 'number')
-        send('progress', { text: `Загрузка языка OCR: ${Math.round(m.progress * 100)}%`, pct: m.progress });
-    },
-  });
-  let timer;
-  const timeout = new Promise((_, rej) => { timer = setTimeout(() => rej(new Error('Не удалось скачать языковой пакет OCR — проверьте интернет')), 90000); });
-  try { worker = await Promise.race([make, timeout]); } finally { clearTimeout(timer); }
-  send('progress', null);
-  workerLang = key;
-  return worker;
-}
-// светлый текст на тёмном фоне Tesseract читает хуже -> инвертируем тёмные кадры
-function prepare(img) {
-  const { width, height } = img.getSize();
-  const buf = Buffer.from(img.toBitmap());
-  let sum = 0, n = 0;
-  for (let i = 0; i < buf.length; i += 64) { sum += (buf[i] + buf[i + 1] + buf[i + 2]) / 3; n++; }
-  if (n && sum / n < 110) for (let i = 0; i < buf.length; i += 4) { buf[i] = 255 - buf[i]; buf[i + 1] = 255 - buf[i + 1]; buf[i + 2] = 255 - buf[i + 2]; }
-  return nativeImage.createFromBitmap(buf, { width, height });
-}
-
-// Возвращает { lines: [{text,x,y,w,h}] в пикселях OCR-картинки, k: пикселей на CSS-пиксель, engine }
+// Возвращает { lines: [{text,x,y,w,h}] в пикселях OCR-картинки, k: пикселей на CSS-пиксель, engine } или null
 async function ocrFrame(d, b, sf) {
-  if (useHelper()) {
+  stat.err = '';
+  if (process.platform === 'darwin') {
+    if (!useHelper()) { stat.err = 'Нет помощника распознавания (Apple Vision) в сборке'; return null; }
     const r = await helperScan(d, b, sf);
     if (r && r.lines) return { lines: r.lines, k: sf, engine: 'Apple Vision' };
     stat.err = 'Vision: ' + (helperErr || 'нет ответа');
+    return null;
   }
+  if (!useWinOcr()) { stat.err = 'Нет файла Windows OCR в сборке'; return null; }
   const img = await grab(d, b, sf);
   if (!img) return null;
   const cssW = img.getSize().width / sf;
-  if (useWinOcr()) {
-    const up = sf >= 2 ? 1 : 2; // Windows OCR лучше читает крупный текст
-    const big = up > 1 ? img.resize({ width: Math.round(img.getSize().width * up), quality: 'best' }) : img;
-    const file = path.join(os.tmpdir(), `st-ocr-${process.pid}.png`);
-    fs.writeFileSync(file, big.toPNG());
-    const r = await psRequest(S.src === 'auto' ? 'auto' : WINOCR[S.src], file);
-    if (r.lines) { psFails = 0; return { lines: r.lines, k: big.getSize().width / cssW, engine: 'Windows OCR' }; }
-    stat.err = 'Windows OCR: ' + r.error;
-    if (!String(r.error).startsWith('no-ocr-language') && ++psFails >= 3) psBroken = true;
-  }
-  const up = sf >= 2 ? 1 : 1.5;
-  const ocrImg = prepare(up > 1 ? img.resize({ width: Math.round(img.getSize().width * up), quality: 'best' }) : img);
-  const w = await getWorker();
-  send('status', 'Распознаю (Tesseract)…');
-  const { data } = await w.recognize(ocrImg.toPNG(), {}, { blocks: true });
-  const raw = data.lines || (data.blocks || []).flatMap((x) => (x.paragraphs || []).flatMap((p) => p.lines || []));
-  const lines = raw.filter((l) => l.confidence > 50).map((l) => ({ text: l.text, x: l.bbox.x0, y: l.bbox.y0, w: l.bbox.x1 - l.bbox.x0, h: l.bbox.y1 - l.bbox.y0 }));
-  return { lines, k: ocrImg.getSize().width / cssW, engine: 'Tesseract (запасной)' };
+  const up = sf >= 2 ? 1 : 2; // Windows OCR лучше читает крупный текст
+  const big = up > 1 ? img.resize({ width: Math.round(img.getSize().width * up), quality: 'best' }) : img;
+  const file = path.join(os.tmpdir(), `st-ocr-${process.pid}.png`);
+  fs.writeFileSync(file, big.toPNG());
+  const tag = S.src === 'auto' ? 'auto' : WINOCR[S.src];
+  const r = await psRequest(tag, file);
+  if (r.lines) return { lines: r.lines, k: big.getSize().width / cssW, engine: 'Windows OCR' };
+  const e = String(r.error || '');
+  if (e.startsWith('no-ocr-language')) stat.err = `Нет языка OCR ${tag}: Параметры → Время и язык → Язык и регион → добавить язык → «Распознавание текста»`;
+  else { stat.err = 'Windows OCR: ' + e; try { ps && ps.kill(); } catch (x) {} } // перезапустим PowerShell
+  return null;
 }
 
 // Собираем строки в абзацы: подряд идущие строки одного размера и выравнивания переводятся вместе
@@ -331,97 +293,221 @@ function clean(t) {
 const letterRatio = (t) => (t.match(/\p{L}/gu) || []).length / Math.max(1, t.replace(/\s/g, '').length);
 
 // ---------- перевод ----------
-async function google(text, retry = true) {
+const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36';
+async function fetchT(url, opts = {}, ms = 10000) {
+  const c = new AbortController();
+  const t = setTimeout(() => c.abort(), ms);
+  try { return await fetch(url, { ...opts, signal: c.signal }); } finally { clearTimeout(t); }
+}
+// не больше `limit` запросов одновременно (иначе Google отвечает 429)
+async function mapLimit(items, limit, fn) {
+  const out = new Array(items.length);
+  let i = 0;
+  const run = async () => {
+    while (i < items.length) {
+      const k = i++;
+      try { out[k] = { status: 'fulfilled', value: await fn(items[k]) }; } catch (e) { out[k] = { status: 'rejected', reason: e }; }
+    }
+  };
+  await Promise.all(Array.from({ length: Math.min(limit, items.length) }, run));
+  return out;
+}
+async function google(text) {
   const sl = S.src === 'auto' ? 'auto' : (S.src === 'zh' ? 'zh-CN' : S.src);
-  const url = `https://translate.googleapis.com/translate_a/single?client=gtx&sl=${sl}&tl=${S.tgt === 'zh' ? 'zh-CN' : S.tgt}&dt=t&q=${encodeURIComponent(text)}`;
-  const r = await fetch(url);
-  if (!r.ok) {
-    if (retry) { await sleep(600); return google(text, false); }
-    throw new Error('Google: HTTP ' + r.status);
+  const tl = S.tgt === 'zh' ? 'zh-CN' : S.tgt;
+  let lastErr = new Error('Google: нет ответа');
+  for (const host of ['translate.googleapis.com', 'translate.google.com']) {
+    for (let attempt = 0; attempt < 2; attempt++) {
+      try {
+        const r = await fetchT(`https://${host}/translate_a/single?client=gtx&sl=${sl}&tl=${tl}&dt=t&q=${encodeURIComponent(text)}`, { headers: { 'User-Agent': UA } });
+        if (r.ok) { const j = await r.json(); return j[0].map((x) => x[0]).filter(Boolean).join(''); }
+        lastErr = new Error('Google: HTTP ' + r.status);
+        if (r.status === 429) await sleep(800 * (attempt + 1)); else break;
+      } catch (e) {
+        lastErr = new Error(e.name === 'AbortError' ? 'Google: нет ответа (10 с)' : 'Google: ' + ((e.cause && e.cause.code) || e.message));
+        break;
+      }
+    }
   }
-  const j = await r.json();
-  return j[0].map((x) => x[0]).join('');
+  throw lastErr;
 }
 
-// Офлайн-модель живёт в отдельном процессе (translator.js)
-const HOSTS = ['https://huggingface.co/', 'https://hf-mirror.com/'];
-let hostIdx = 0, child = null, seq = 0;
-const pending = new Map();
-const mb = (n) => (n / 1048576).toFixed(0);
-function killChild() { if (child) { const c = child; child = null; c.kill(); } }
-function cancelPending() {
-  for (const p of pending.values()) { clearTimeout(p.timer); p.reject(new Error('cancelled')); }
-  pending.clear();
-}
-function ensureChild() {
-  if (child) return child;
-  const c = child = utilityProcess.fork(path.join(__dirname, 'translator.js'));
-  c.on('message', (m) => {
-    if (m.type) {
-      for (const p of pending.values()) p.arm();
-      if (S.engine !== 'offline') return;
-      if (m.type === 'progress') send('progress', { text: `Загрузка модели ${m.key}: ${mb(m.loaded)} / ${mb(m.total)} МБ`, pct: m.loaded / m.total });
-      else if (m.type === 'loading') send('progress', { text: `Загрузка модели ${m.key}…`, pct: null });
-      else if (m.type === 'ready') send('progress', null);
-      return;
-    }
-    const p = pending.get(m.id);
-    if (!p) return;
-    clearTimeout(p.timer); pending.delete(m.id);
-    if (m.ok) p.resolve(m.value); else p.reject(new Error(m.error));
+// ---- Локальная нейросеть для перевода: TranslateGemma через Ollama (работает на видеокарте) ----
+const OLLAMA = 'http://127.0.0.1:11434';
+const LNAME = { en: ['English', 'en'], ru: ['Russian', 'ru'], de: ['German', 'de'], fr: ['French', 'fr'], es: ['Spanish', 'es'], zh: ['Chinese', 'zh-Hans'], ja: ['Japanese', 'ja'] };
+let llmReady = '', pullCtl = null;
+async function pullModel() {
+  pullCtl = new AbortController();
+  const r = await fetch(OLLAMA + '/api/pull', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ model: S.llmModel, name: S.llmModel, stream: true }), signal: pullCtl.signal,
   });
-  c.on('exit', () => {
-    if (child === c) child = null;
-    for (const p of pending.values()) { clearTimeout(p.timer); p.reject(new Error('Процесс перевода завершился')); }
-    pending.clear();
-  });
-  return c;
-}
-function callWorker(text, s, t) {
-  return new Promise((resolve, reject) => {
-    const id = ++seq;
-    const p = { resolve, reject, timer: null };
-    p.arm = () => {
-      clearTimeout(p.timer);
-      p.timer = setTimeout(() => {
-        pending.delete(id); killChild();
-        reject(new Error(`Нет ответа от ${new URL(HOSTS[hostIdx]).host} (60 с)`));
-      }, 60000);
-    };
-    pending.set(id, p); p.arm();
-    ensureChild().postMessage({ id, text, s, t, model: S.offlineModel, host: HOSTS[hostIdx], cacheDir: path.join(app.getPath('userData'), 'models') });
-  });
-}
-async function step(text, s, t) {
-  for (let attempt = 0; ; attempt++) {
-    try { return await callWorker(text, s, t); }
-    catch (e) {
-      if (e.message === 'cancelled') throw e;
-      if (attempt === 0) {
-        hostIdx = (hostIdx + 1) % HOSTS.length;
-        send('progress', { text: `Не вышло, пробую ${new URL(HOSTS[hostIdx]).host}…`, pct: null });
-        continue;
-      }
-      hostIdx = 0; throw e;
+  if (!r.ok || !r.body) throw new Error('Ollama: не удалось начать загрузку модели');
+  const reader = r.body.getReader(), dec = new TextDecoder();
+  let buf = '';
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    buf += dec.decode(value, { stream: true });
+    let i;
+    while ((i = buf.indexOf('\n')) >= 0) {
+      const line = buf.slice(0, i).trim(); buf = buf.slice(i + 1);
+      if (!line) continue;
+      const m = JSON.parse(line);
+      if (m.error) throw new Error('Ollama: ' + m.error);
+      if (m.total) send('progress', { text: `Загрузка ${S.llmModel}: ${mb(m.completed || 0)} / ${mb(m.total)} МБ`, pct: (m.completed || 0) / m.total });
+      else send('progress', { text: `Ollama: ${m.status}`, pct: null });
     }
   }
+  send('progress', null);
 }
+// ---- Ollama встроена: если её нет, приложение само скачает, распакует и запустит её ----
+const OLLAMA_URL = process.platform === 'darwin'
+  ? 'https://github.com/ollama/ollama/releases/latest/download/ollama-darwin.tgz'
+  : `https://github.com/ollama/ollama/releases/latest/download/ollama-windows-${process.arch === 'arm64' ? 'arm64' : 'amd64'}.zip`;
+const OLLAMA_EXE = process.platform === 'win32' ? 'ollama.exe' : 'ollama';
+const ollamaDir = () => path.join(app.getPath('userData'), 'ollama');
+let ollamaProc = null, dlCtl = null, userAbort = false;
+
+function findFile(dir, name, depth = 3) {
+  try {
+    for (const e of fs.readdirSync(dir, { withFileTypes: true })) {
+      const p = path.join(dir, e.name);
+      if (e.isFile() && e.name === name) return p;
+      if (e.isDirectory() && depth > 0) { const f = findFile(p, name, depth - 1); if (f) return f; }
+    }
+  } catch (e) {}
+  return null;
+}
+function ollamaBin() {
+  const own = findFile(ollamaDir(), OLLAMA_EXE);
+  if (own) return own;
+  const cands = [];
+  if (process.platform === 'win32') cands.push(path.join(process.env.LOCALAPPDATA || '', 'Programs', 'Ollama', 'ollama.exe'));
+  if (process.platform === 'darwin') cands.push('/Applications/Ollama.app/Contents/Resources/ollama');
+  return cands.find((p) => fs.existsSync(p)) || null;
+}
+const ollamaAlive = async () => { try { return (await fetchT(OLLAMA + '/api/tags', {}, 2500)).ok; } catch (e) { return false; } };
+function abortDownloads() {
+  userAbort = true;
+  for (const c of [pullCtl, dlCtl]) if (c) c.abort();
+  pullCtl = dlCtl = null;
+}
+function killOllama() {
+  if (!ollamaProc) return;
+  const p = ollamaProc; ollamaProc = null;
+  try { if (process.platform === 'win32') spawn('taskkill', ['/pid', String(p.pid), '/T', '/F'], { windowsHide: true }); else p.kill(); } catch (e) {}
+}
+
+// Скачивание с докачкой (Range) и контролем зависания
+async function downloadTo(url, dest, label) {
+  const part = dest + '.part';
+  let have = fs.existsSync(part) ? fs.statSync(part).size : 0;
+  userAbort = false;
+  dlCtl = new AbortController();
+  let stall;
+  const kick = () => { clearTimeout(stall); stall = setTimeout(() => dlCtl && dlCtl.abort(), 60000); };
+  kick();
+  try {
+    const r = await fetch(url, { headers: have ? { Range: `bytes=${have}-` } : {}, signal: dlCtl.signal, redirect: 'follow' });
+    if (r.status === 416) { fs.renameSync(part, dest); return; } // уже докачано
+    if (!r.ok && r.status !== 206) throw new Error(`Загрузка Ollama: HTTP ${r.status}`);
+    if (r.status === 200) have = 0; // сервер не поддержал докачку
+    const total = have + Number(r.headers.get('content-length') || 0);
+    const out = fs.createWriteStream(part, { flags: have ? 'a' : 'w' });
+    const reader = r.body.getReader();
+    let got = have, last = 0;
+    try {
+      for (;;) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        kick();
+        if (!out.write(value)) await new Promise((res) => out.once('drain', res));
+        got += value.length;
+        if (Date.now() - last > 300) { last = Date.now(); send('progress', { text: `${label}: ${mb(got)} / ${mb(total)} МБ`, pct: total ? got / total : null }); }
+      }
+    } finally { await new Promise((res) => out.end(res)); }
+    fs.renameSync(part, dest);
+  } catch (e) {
+    if (e.name === 'AbortError') throw new Error(userAbort ? 'cancelled' : 'Нет данных 60 с — загрузка прервана, повторите (она докачается)');
+    throw e;
+  } finally { clearTimeout(stall); dlCtl = null; }
+}
+function extract(archive, dir) {
+  return new Promise((resolve, reject) => {
+    const args = process.platform === 'win32' ? ['-xf', archive, '-C', dir] : ['-xzf', archive, '-C', dir];
+    execFile('tar', args, { timeout: 900000 }, (err) => (err ? reject(new Error('Не удалось распаковать Ollama: ' + err.message)) : resolve()));
+  });
+}
+
+async function ensureOllama() {
+  if (await ollamaAlive()) return; // уже запущена (своя или установленная)
+  let bin = ollamaBin();
+  if (!bin) {
+    if (!S.llmConsent) {
+      const big = S.llmModel.endsWith('12b') ? '8,1' : '3,3';
+      const r = await dialog.showMessageBox({
+        type: 'question', buttons: ['Скачать', 'Отмена'], defaultId: 0, cancelId: 1, title: 'Локальный AI-перевод',
+        message: `Для режима AI нужно скачать Ollama (${process.platform === 'win32' ? '≈1,4 ГБ' : '≈150 МБ'}) и модель ${S.llmModel} (≈${big} ГБ).`,
+        detail: 'Скачивание однократное, потом перевод работает без интернета. Ollama хранится в папке приложения и запускается автоматически. Загрузку можно прервать — она продолжится с того же места.',
+      });
+      if (r.response !== 0) throw new Error('AI: загрузка отменена (кнопка G — вернуться к Google)');
+      S.llmConsent = true; save();
+    }
+    fs.mkdirSync(ollamaDir(), { recursive: true });
+    const archive = path.join(ollamaDir(), path.basename(OLLAMA_URL));
+    await downloadTo(OLLAMA_URL, archive, 'Загрузка Ollama');
+    send('progress', { text: 'Распаковка Ollama…', pct: null });
+    await extract(archive, ollamaDir());
+    try { fs.unlinkSync(archive); } catch (e) {}
+    bin = findFile(ollamaDir(), OLLAMA_EXE);
+    if (!bin) throw new Error('В архиве Ollama не найден ' + OLLAMA_EXE);
+    if (process.platform !== 'win32') fs.chmodSync(bin, 0o755);
+  }
+  send('progress', { text: 'Запускаю Ollama…', pct: null });
+  ollamaProc = spawn(bin, ['serve'], { env: { ...process.env, OLLAMA_HOST: '127.0.0.1:11434', OLLAMA_KEEP_ALIVE: '30m' }, windowsHide: true, stdio: 'ignore' });
+  ollamaProc.on('exit', () => { ollamaProc = null; });
+  ollamaProc.on('error', () => { ollamaProc = null; });
+  for (let t0 = Date.now(); Date.now() - t0 < 45000; await sleep(700)) if (await ollamaAlive()) { send('progress', null); return; }
+  throw new Error('Ollama не запустилась (проверьте драйвер видеокарты)');
+}
+
+async function ensureLlm() {
+  if (llmReady === S.llmModel) return;
+  await ensureOllama();
+  let tags;
+  try { tags = await (await fetchT(OLLAMA + '/api/tags', {}, 4000)).json(); }
+  catch (e) { throw new Error('Ollama не отвечает'); }
+  if (!(tags.models || []).some((m) => m.name === S.llmModel || m.model === S.llmModel)) {
+    try { await pullModel(); } catch (e) { if (e.name === 'AbortError') throw new Error('cancelled'); throw e; }
+  }
+  llmReady = S.llmModel;
+}
+async function llm(text) {
+  await ensureLlm();
+  const sCode = S.src === 'auto' ? (await detect(text)) || 'en' : S.src;
+  if (sCode === S.tgt) return text;
+  const [sn, sc] = LNAME[sCode], [tn, tc] = LNAME[S.tgt];
+  const prompt = `You are a professional ${sn} (${sc}) to ${tn} (${tc}) translator. Your goal is to accurately convey the meaning and nuances of the original ${sn} text while adhering to ${tn} grammar, vocabulary, and cultural sensitivities.\nProduce only the ${tn} translation, without any additional explanations or commentary. Please translate the following ${sn} text into ${tn}:\n\n\n${text}`;
+  const r = await fetchT(OLLAMA + '/api/chat', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ model: S.llmModel, stream: false, keep_alive: '30m', options: { temperature: 0 }, messages: [{ role: 'user', content: prompt }] }),
+  }, 180000);
+  const j = await r.json();
+  if (j.error) throw new Error('Ollama: ' + j.error);
+  return String((j.message && j.message.content) || '').trim();
+}
+
+const mb = (n) => (n / 1048576).toFixed(0);
 async function detect(text) {
   const { franc } = await import('franc-min');
   return FRANC[franc(text, { minLength: 10 })] || null;
 }
-async function offline(text) {
-  const t = S.tgt;
-  const s = S.src === 'auto' ? (await detect(text)) || 'en' : S.src;
-  if (s === t) return text;
-  if (S.offlineModel === 'nllb' || s === 'en' || t === 'en') return step(text, s, t);
-  return step(await step(text, s, 'en'), 'en', t);
-}
 const cache = new Map();
 async function translate(text) {
-  const key = `${S.engine}|${S.offlineModel}|${S.src}|${S.tgt}|${text}`;
+  const key = `${S.engine}|${S.llmModel}|${S.src}|${S.tgt}|${text}`;
   if (cache.has(key)) return cache.get(key);
-  const out = S.engine === 'google' ? await google(text) : await offline(text);
+  const out = S.engine === 'llm' ? await llm(text) : await google(text);
   if (cache.size > 500) cache.clear();
   cache.set(key, out);
   return out;
@@ -491,7 +577,7 @@ async function cycle() {
   send('status', 'Распознаю…');
   const o = await ocrFrame(d, b, sf);
   stat.ocr += Date.now() - t1; stat.runs++;
-  if (!o) return true;
+  if (!o) { send('status', (stat.err || 'Распознавание недоступно').slice(0, 120)); return true; }
   stat.engine = o.engine;
   if (g !== gen) return true;
   const paras = groupLines(o.lines, (b.width - 2 * BORDER) * o.k)
@@ -503,7 +589,7 @@ async function cycle() {
   send('status', 'Перевожу…');
   const texts = paras.map((p) => p.text);
   const res = [];
-  if (S.engine === 'google') res.push(...(await Promise.allSettled(texts.map(translate))));
+  if (S.engine === 'google') res.push(...(await mapLimit(texts, 2, translate)));
   else for (const t of texts) {
     if (g !== gen) break;
     try { res.push({ status: 'fulfilled', value: await translate(t) }); } catch (e) { res.push({ status: 'rejected', reason: e }); }
@@ -519,8 +605,7 @@ async function cycle() {
   send('result', items);
   lastItems = items.length;
   lastTexts = items.map((x) => x.text);
-  let msg = fail && fail.reason.message !== 'cancelled' ? String(fail.reason.message || fail.reason).slice(0, 80) : '';
-  if (!msg && o.engine.startsWith('Tesseract') && stat.err) msg = stat.err.slice(0, 80);
+  let msg = fail && fail.reason.message !== 'cancelled' ? (String(fail.reason.message || fail.reason) + (S.engine === 'google' ? ' → кнопка AI' : '')).slice(0, 90) : '';
   if (!msg && !items.length && access !== 'granted') msg = `Текста нет. Если он есть — проверьте запись экрана (статус: ${access})`;
   send('status', msg);
   return true;
@@ -540,6 +625,7 @@ async function tick() {
 
 if (!app.requestSingleInstanceLock()) app.quit();
 load();
+if (S.engine === 'offline') S.engine = 'google'; // офлайн-движок удалён
 if (process.platform === 'darwin' && S.legacyCapture) app.commandLine.appendSwitch('disable-features', 'ScreenCaptureKitMac');
 app.whenReady().then(() => {
   createWindow();
@@ -549,6 +635,6 @@ app.whenReady().then(() => {
   globalShortcut.register('CommandOrControl+Shift+Y', force);
   globalShortcut.register('CommandOrControl+Alt+C', copyAll);
 });
-app.on('before-quit', () => { save(); killChild(); try { ps && ps.kill(); } catch (e) {} });
+app.on('before-quit', () => { save(); killOllama(); try { ps && ps.kill(); } catch (e) {} });
 app.on('will-quit', () => globalShortcut.unregisterAll());
 app.on('window-all-closed', () => app.quit());
