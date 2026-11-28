@@ -20,8 +20,10 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 // ---------- помощники ----------
 // macOS: capture (Swift): снимок без окна приложения + Apple Vision OCR
 const helperPath = path.join(process.resourcesPath || '', 'capture');
-let helperBroken = false, helperFails = 0, helperErr = '';
-const useHelper = () => process.platform === 'darwin' && !helperBroken && fs.existsSync(helperPath);
+let helperFails = 0, helperErr = '', helperRetryAt = 0;
+const helperExists = () => process.platform === 'darwin' && fs.existsSync(helperPath);
+// после серии сбоев помощник отключается лишь на 20 секунд, а не до перезапуска
+const useHelper = () => helperExists() && Date.now() >= helperRetryAt;
 // Windows: встроенный Windows OCR через постоянный процесс PowerShell (native/ocr.ps1)
 const psScript = () => [path.join(process.resourcesPath || '', 'ocr.ps1'), path.join(__dirname, 'native', 'ocr.ps1')].find((p) => fs.existsSync(p));
 let ps = null, psBuf = '', psWait = [];
@@ -90,7 +92,7 @@ async function selfTest() {
     const bm = img.toBitmap(), i = ((height >> 1) * width + (width >> 1)) * 4;
     S.capturesSelf = bm[i] > 200 && bm[i + 1] < 90 && bm[i + 2] > 200;
     save();
-    if (S.capturesSelf && process.platform === 'darwin' && !S.legacyCapture && !S.legacyTried && !useHelper()) {
+    if (S.capturesSelf && process.platform === 'darwin' && !S.legacyCapture && !S.legacyTried && !helperExists()) {
       S.legacyTried = true; S.legacyCapture = true; save(); app.relaunch(); app.exit(0);
     }
   } catch (e) { send('selftest', false); }
@@ -104,7 +106,7 @@ async function diag() {
     type: 'info', title: 'Диагностика', message: 'Screen Translator ' + app.getVersion(),
     detail: [
       `ОС: ${process.platform} ${os.release()}, Electron ${process.versions.electron}`,
-      `Захват: ${useHelper() ? 'помощник ScreenCaptureKit (без окна приложения)' : 'стандартный'}; окно попадает в захват: ${S.capturesSelf === undefined ? 'не проверено' : S.capturesSelf ? 'да' : 'нет'}`,
+      `Помощник: ${!helperExists() ? 'нет в сборке' : useHelper() ? 'работает' : 'временно отключён после сбоев'}; последняя ошибка: ${helperErr || '—'}\n  Захват: ${useHelper() ? 'ScreenCaptureKit (без окна приложения)' : 'стандартный'}; окно попадает в захват: ${S.capturesSelf === undefined ? 'не проверено' : S.capturesSelf ? 'да' : 'нет'}`,
       `Распознавание: ${stat.engine || 'ещё не запускалось'}${stat.err ? '\nПоследняя ошибка OCR: ' + stat.err : ''}`,
       `Режим: ${S.auto === false ? 'по горячей клавише' : 'авто'}, движок: ${S.engine}, язык: ${S.src} → ${S.tgt}, AI: ${S.llmModel} (Ollama: ${ollamaProc ? 'запущена приложением' : 'внешняя/не запущена'})`,
       `Проверок экрана: ${stat.polls}, среднее ${Math.round(stat.grab / n)} мс`,
@@ -131,8 +133,8 @@ function refreshMenu() {
     { label: 'Перевести сейчас', click: force },
     { label: 'Копировать весь перевод (Ctrl/Cmd+Alt+C)', click: copyAll },
     { label: 'AI-модель (Ollama, кнопка AI)', submenu: [
-      { label: 'TranslateGemma 4B (3.3 ГБ, быстрее)', type: 'radio', checked: S.llmModel === 'translategemma:4b', click: () => setLlm('translategemma:4b') },
-      { label: 'TranslateGemma 12B (8.1 ГБ, качественнее)', type: 'radio', checked: S.llmModel === 'translategemma:12b', click: () => setLlm('translategemma:12b') },
+      { label: 'TranslateGemma 4B (2,5 ГБ, быстрее)', type: 'radio', checked: S.llmModel === 'translategemma:4b', click: () => setLlm('translategemma:4b') },
+      { label: 'TranslateGemma 12B (7,3 ГБ, качественнее)', type: 'radio', checked: S.llmModel === 'translategemma:12b', click: () => setLlm('translategemma:12b') },
     ] },
     ...(process.platform === 'darwin' ? [{
       label: 'Настройки записи экрана…',
@@ -238,11 +240,13 @@ function psRequest(tag, file) {
 async function ocrFrame(d, b, sf) {
   stat.err = '';
   if (process.platform === 'darwin') {
-    if (!useHelper()) { stat.err = 'Нет помощника распознавания (Apple Vision) в сборке'; return null; }
-    const shot = await helperShot(d, b, sf);
-    if (!shot) { stat.err = helperErr || 'Снимок экрана не получен'; return null; }
-    const r = await helperOcr(path.join(os.tmpdir(), `st-${process.pid}-${sf > 0.5 ? 'f' : 's'}.png`));
-    if (r && r.lines) return { lines: r.lines, k: sf, engine: 'Apple Vision' };
+    if (!helperExists()) { stat.err = 'Нет помощника распознавания (Apple Vision) в сборке'; return null; }
+    const img = await grab(d, b, sf); // помощник (без окна приложения) или, при его сбое, обычный захват
+    if (!img) { stat.err = helperErr || 'Снимок экрана не получен (проверьте «Запись экрана»)'; return null; }
+    const file = path.join(os.tmpdir(), `st-${process.pid}-ocr.png`);
+    fs.writeFileSync(file, img.toPNG());
+    const r = await helperOcr(file);
+    if (r && r.lines) return { lines: r.lines, k: img.getSize().width / (b.width - 2 * BORDER), engine: 'Apple Vision' };
     stat.err = helperErr || 'Vision: нет ответа';
     return null;
   }
@@ -344,13 +348,53 @@ async function google(text) {
 const OLLAMA = 'http://127.0.0.1:11434';
 const LNAME = { en: ['English', 'en'], ru: ['Russian', 'ru'], de: ['German', 'de'], fr: ['French', 'fr'], es: ['Spanish', 'es'], zh: ['Chinese', 'zh-Hans'], ja: ['Japanese', 'ja'] };
 let llmReady = '', pullCtl = null;
-async function pullModel() {
-  pullCtl = new AbortController();
-  const r = await fetch(OLLAMA + '/api/pull', {
-    method: 'POST', headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ model: S.llmModel, name: S.llmModel, stream: true }), signal: pullCtl.signal,
+// Реестр registry.ollama.ai часто недоступен, поэтому модель берём файлом GGUF с Hugging Face (через зеркало)
+// и сами создаём её в Ollama: скачивание -> загрузка blob -> /api/create.
+const GGUF = {
+  'translategemma:4b': [{ repo: '42ailab/TranslateGemma-4B-GGUF', file: 'translategemma-4b-it-Q4_K_M.gguf' }, { repo: 'anilb/translategemma-gguf', file: 'translategemma-4b-it.Q4_K_M.gguf' }],
+  'translategemma:12b': [{ repo: '42ailab/TranslateGemma-12B-GGUF', file: 'translategemma-12b-it-Q4_K_M.gguf' }, { repo: 'anilb/translategemma-gguf', file: 'translategemma-12b-it.Q4_K_M.gguf' }],
+};
+const SIZE_GB = { 'translategemma:4b': '2,5', 'translategemma:12b': '7,3' };
+const HF_HOSTS = ['https://hf-mirror.com', 'https://huggingface.co'];
+const GEMMA_TEMPLATE = '<start_of_turn>user\n{{ .Prompt }}<end_of_turn>\n<start_of_turn>model\n';
+const localName = () => 'st-' + S.llmModel; // например st-translategemma:4b
+let llmUse = '';
+
+function sha256File(file) {
+  return new Promise((resolve, reject) => {
+    const h = require('crypto').createHash('sha256');
+    const size = fs.statSync(file).size;
+    let done = 0, last = 0;
+    fs.createReadStream(file, { highWaterMark: 4 << 20 })
+      .on('data', (c) => { h.update(c); done += c.length; if (Date.now() - last > 400) { last = Date.now(); send('progress', { text: `Проверка файла: ${mb(done)} / ${mb(size)} МБ`, pct: done / size }); } })
+      .on('end', () => resolve(h.digest('hex'))).on('error', reject);
   });
-  if (!r.ok || !r.body) throw new Error('Ollama: не удалось начать загрузку модели');
+}
+async function uploadBlob(file, hex) {
+  const url = `${OLLAMA}/api/blobs/sha256:${hex}`;
+  const head = await fetchT(url, { method: 'HEAD' }, 5000).catch(() => null);
+  if (head && head.ok) return; // такой файл Ollama уже знает
+  const { Readable } = require('stream');
+  const size = fs.statSync(file).size;
+  let sent = 0, last = 0;
+  async function* chunks() {
+    for await (const c of fs.createReadStream(file, { highWaterMark: 4 << 20 })) {
+      sent += c.length;
+      if (Date.now() - last > 400) { last = Date.now(); send('progress', { text: `Передача модели в Ollama: ${mb(sent)} / ${mb(size)} МБ`, pct: sent / size }); }
+      yield c;
+    }
+  }
+  dlCtl = new AbortController();
+  const r = await fetch(url, { method: 'POST', headers: { 'Content-Type': 'application/octet-stream', 'Content-Length': String(size) }, body: Readable.toWeb(Readable.from(chunks(), { objectMode: false })), duplex: 'half', signal: dlCtl.signal });
+  if (!r.ok) throw new Error('Ollama: не удалось передать файл модели (HTTP ' + r.status + ')');
+}
+async function createLocal(file, hex) {
+  dlCtl = new AbortController();
+  const r = await fetch(OLLAMA + '/api/create', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' }, signal: dlCtl.signal,
+    body: JSON.stringify({ model: localName(), name: localName(), files: { [file]: 'sha256:' + hex }, template: GEMMA_TEMPLATE, parameters: { stop: ['<end_of_turn>'] }, stream: true }),
+  });
+  if (!r.ok || !r.body) throw new Error('Ollama: не удалось создать модель (HTTP ' + r.status + ')');
   const reader = r.body.getReader(), dec = new TextDecoder();
   let buf = '';
   for (;;) {
@@ -363,12 +407,27 @@ async function pullModel() {
       if (!line) continue;
       const m = JSON.parse(line);
       if (m.error) throw new Error('Ollama: ' + m.error);
-      if (m.total) send('progress', { text: `Загрузка ${S.llmModel}: ${mb(m.completed || 0)} / ${mb(m.total)} МБ`, pct: (m.completed || 0) / m.total });
-      else send('progress', { text: `Ollama: ${m.status}`, pct: null });
+      if (m.status) send('progress', { text: 'Создание модели: ' + m.status, pct: null });
     }
   }
-  send('progress', null);
 }
+async function fetchGguf() {
+  const dir = path.join(app.getPath('userData'), 'gguf');
+  fs.mkdirSync(dir, { recursive: true });
+  let lastErr = new Error('Не удалось скачать модель');
+  for (const c of GGUF[S.llmModel]) {
+    const dest = path.join(dir, c.file);
+    if (fs.existsSync(dest)) return { dest, file: c.file };
+    for (const host of HF_HOSTS) {
+      try {
+        await downloadTo(`${host}/${c.repo}/resolve/main/${c.file}`, dest, `Загрузка ${S.llmModel} (${new URL(host).host})`);
+        return { dest, file: c.file };
+      } catch (e) { if (e.message === 'cancelled') throw e; lastErr = e; }
+    }
+  }
+  throw lastErr;
+}
+
 // ---- Ollama встроена: если её нет, приложение само скачает, распакует и запустит её ----
 const OLLAMA_URL = process.platform === 'darwin'
   ? 'https://github.com/ollama/ollama/releases/latest/download/ollama-darwin.tgz'
@@ -419,7 +478,7 @@ async function downloadTo(url, dest, label) {
   try {
     const r = await fetch(url, { headers: have ? { Range: `bytes=${have}-` } : {}, signal: dlCtl.signal, redirect: 'follow' });
     if (r.status === 416) { fs.renameSync(part, dest); return; } // уже докачано
-    if (!r.ok && r.status !== 206) throw new Error(`Загрузка Ollama: HTTP ${r.status}`);
+    if (!r.ok && r.status !== 206) throw new Error(`Загрузка: HTTP ${r.status}`);
     if (r.status === 200) have = 0; // сервер не поддержал докачку
     const total = have + Number(r.headers.get('content-length') || 0);
     const out = fs.createWriteStream(part, { flags: have ? 'a' : 'w' });
@@ -453,7 +512,7 @@ async function ensureOllama() {
   let bin = ollamaBin();
   if (!bin) {
     if (!S.llmConsent) {
-      const big = S.llmModel.endsWith('12b') ? '8,1' : '3,3';
+      const big = SIZE_GB[S.llmModel];
       const r = await dialog.showMessageBox({
         type: 'question', buttons: ['Скачать', 'Отмена'], defaultId: 0, cancelId: 1, title: 'Локальный AI-перевод',
         message: `Для режима AI нужно скачать Ollama (${process.platform === 'win32' ? '≈1,4 ГБ' : '≈150 МБ'}) и модель ${S.llmModel} (≈${big} ГБ).`,
@@ -486,8 +545,20 @@ async function ensureLlm() {
   let tags;
   try { tags = await (await fetchT(OLLAMA + '/api/tags', {}, 4000)).json(); }
   catch (e) { throw new Error('Ollama не отвечает'); }
-  if (!(tags.models || []).some((m) => m.name === S.llmModel || m.model === S.llmModel)) {
-    try { await pullModel(); } catch (e) { if (e.name === 'AbortError') throw new Error('cancelled'); throw e; }
+  const names = (tags.models || []).map((m) => m.name);
+  if (names.includes(S.llmModel)) llmUse = S.llmModel;       // официальная модель уже есть
+  else if (names.includes(localName())) llmUse = localName(); // создана приложением раньше
+  else {
+    try {
+      const { dest, file } = await fetchGguf();
+      const hex = await sha256File(dest);
+      await uploadBlob(dest, hex);
+      send('progress', { text: 'Создание модели в Ollama…', pct: null });
+      await createLocal(file, hex);
+      try { fs.unlinkSync(dest); } catch (e) {} // копия уже внутри Ollama
+      llmUse = localName();
+    } catch (e) { if (e.name === 'AbortError') throw new Error('cancelled'); throw e; }
+    send('progress', null);
   }
   llmReady = S.llmModel;
 }
@@ -499,7 +570,7 @@ async function llm(text) {
   const prompt = `You are a professional ${sn} (${sc}) to ${tn} (${tc}) translator. Your goal is to accurately convey the meaning and nuances of the original ${sn} text while adhering to ${tn} grammar, vocabulary, and cultural sensitivities.\nProduce only the ${tn} translation, without any additional explanations or commentary. Please translate the following ${sn} text into ${tn}:\n\n\n${text}`;
   const r = await fetchT(OLLAMA + '/api/chat', {
     method: 'POST', headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ model: S.llmModel, stream: false, keep_alive: '30m', options: { temperature: 0 }, messages: [{ role: 'user', content: prompt }] }),
+    body: JSON.stringify({ model: llmUse || S.llmModel, stream: false, keep_alive: '30m', options: { temperature: 0 }, messages: [{ role: 'user', content: prompt }] }),
   }, 180000);
   const j = await r.json();
   if (j.error) throw new Error('Ollama: ' + j.error);
@@ -526,9 +597,9 @@ async function grab(d, b, scale, noHide) {
   if (useHelper()) {
     const img = await helperShot(d, b, scale);
     if (img) { helperFails = 0; return img; }
-    if (++helperFails >= 3) { helperBroken = true; S.capturesSelf = true; }
+    if (++helperFails >= 3) { helperFails = 0; helperRetryAt = Date.now() + 20000; }
   }
-  const hide = !noHide && hideMode() && lastItems > 0;
+  const hide = !noHide && (hideMode() || helperExists()) && lastItems > 0; // запасной путь на Mac: окно может попасть в кадр
   if (hide) { send('hide', true); await sleep(140); }
   let srcs;
   try {
