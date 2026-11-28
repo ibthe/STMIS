@@ -172,15 +172,21 @@ function differs(a, b) {
 }
 
 // ---------- OCR ----------
-// 1) macOS: Apple Vision через помощник
-function helperScan(d, b, sf) {
-  const w = b.width - 2 * BORDER, h = b.height - HEADER - BORDER;
+// 1) macOS: Apple Vision через помощник (снимок и распознавание — двумя отдельными вызовами)
+let helperOcrDone = false;
+function whyFailed(err, stderr, timeout) {
+  const last = String(stderr || '').trim().split('\n').filter(Boolean).pop() || 'нет сообщения';
+  if (err.killed) return `таймаут ${Math.round(timeout / 1000)} с, последний шаг: ${last}`;
+  return `код ${err.code}${err.signal ? ', сигнал ' + err.signal : ''}: ${last}`;
+}
+function helperOcr(file) {
   const langs = S.src === 'auto' ? '' : VISION[S.src];
-  const args = ['scan', d.id, b.x - d.bounds.x + BORDER, b.y - d.bounds.y + HEADER, w, h,
-    Math.round(w * sf), Math.round(h * sf), process.pid, langs].map(String);
-  return new Promise((resolve) => execFile(helperPath, args, { timeout: 20000, maxBuffer: 16 << 20 }, (err, stdout, stderr) => {
-    if (err) { helperErr = String(stderr || err.message).trim().slice(0, 100); return resolve(null); }
-    try { resolve(JSON.parse(stdout)); } catch (e) { helperErr = 'bad json'; resolve(null); }
+  const timeout = helperOcrDone ? 30000 : 150000;
+  if (!helperOcrDone) send('progress', { text: 'Первый запуск Apple Vision: готовится модель (до 2 минут)…', pct: null });
+  return new Promise((resolve) => execFile(helperPath, ['ocr', file, langs], { timeout, maxBuffer: 16 << 20 }, (err, stdout, stderr) => {
+    send('progress', null);
+    if (err) { helperErr = 'Vision: ' + whyFailed(err, stderr, timeout); return resolve(null); }
+    try { const j = JSON.parse(stdout); helperOcrDone = true; resolve(j); } catch (e) { helperErr = 'Vision: некорректный ответ'; resolve(null); }
   }));
 }
 function helperShot(d, b, scale) {
@@ -188,8 +194,8 @@ function helperShot(d, b, scale) {
   const w = b.width - 2 * BORDER, h = b.height - HEADER - BORDER;
   const args = ['shot', d.id, b.x - d.bounds.x + BORDER, b.y - d.bounds.y + HEADER, w, h,
     Math.max(8, Math.round(w * scale)), Math.max(8, Math.round(h * scale)), process.pid, out].map(String);
-  return new Promise((resolve) => execFile(helperPath, args, { timeout: 8000 }, (err) => {
-    if (err) return resolve(null);
+  return new Promise((resolve) => execFile(helperPath, args, { timeout: 15000 }, (err, stdout, stderr) => {
+    if (err) { helperErr = 'Снимок: ' + whyFailed(err, stderr, 15000); return resolve(null); }
     const img = nativeImage.createFromPath(out);
     resolve(img.isEmpty() ? null : img);
   }));
@@ -233,9 +239,11 @@ async function ocrFrame(d, b, sf) {
   stat.err = '';
   if (process.platform === 'darwin') {
     if (!useHelper()) { stat.err = 'Нет помощника распознавания (Apple Vision) в сборке'; return null; }
-    const r = await helperScan(d, b, sf);
+    const shot = await helperShot(d, b, sf);
+    if (!shot) { stat.err = helperErr || 'Снимок экрана не получен'; return null; }
+    const r = await helperOcr(path.join(os.tmpdir(), `st-${process.pid}-${sf > 0.5 ? 'f' : 's'}.png`));
     if (r && r.lines) return { lines: r.lines, k: sf, engine: 'Apple Vision' };
-    stat.err = 'Vision: ' + (helperErr || 'нет ответа');
+    stat.err = helperErr || 'Vision: нет ответа';
     return null;
   }
   if (!useWinOcr()) { stat.err = 'Нет файла Windows OCR в сборке'; return null; }

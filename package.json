@@ -1,6 +1,6 @@
 {
   "name": "screen-translator",
-  "version": "0.9.1",
+  "version": "0.9.2",
   "description": "Прозрачное окно поверх всех окон, которое переводит текст под собой",
   "main": "main.js",
   "scripts": {
